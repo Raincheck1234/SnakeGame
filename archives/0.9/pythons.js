@@ -2247,133 +2247,138 @@ window.MM.camera.init = function * (device_path, width,height, preview, grabber)
 window.svg = { }
 
 window.svg.init = function () {
-     // Use OffscreenCanvas if supported, otherwise a hidden HTMLCanvasElement
-    if (svg.screen)
-        return // Already initialized
-
-     try {
-         svg.screen = new OffscreenCanvas(canvas.width, canvas.height); // canvas needs to be defined globally or passed
-         console.log("Using OffscreenCanvas for SVG rendering.");
-     } catch (e) {
-         console.warn("OffscreenCanvas not supported or failed for SVG, falling back to hidden HTMLCanvasElement:", e);
-         svg.screen = document.createElement('canvas');
-         svg.screen.width = canvas ? canvas.width : 640; // Default size if canvas is not defined yet
-         svg.screen.height = canvas ? canvas.height : 480;
-         svg.screen.style.display = 'none'; // Keep it hidden
-         document.body.appendChild(svg.screen); // Add to body even if hidden
-     }
-
-     // Check if canvas is defined for context size
-     if (window.canvas) {
-         svg.screen.width = canvas.width;
-         svg.screen.height = canvas.height;
-     } else {
-         console.warn("SVG init: 'canvas' element not found. Using default size.");
-     }
-
-
-    svg.ctx = svg.screen.getContext('2d');
-     if (!svg.ctx) {
-         console.error("Failed to get 2D context for SVG rendering canvas.");
-         // Maybe mark svg functionality as broken?
-     }
-}
-
-window.svg.render =  async function * (path, dest) {
-     if (!svg.ctx) {
-          console.error("SVG rendering context not initialized. Call svg.init first or ensure canvas exists.");
-          yield new Error("SVG context not available"); // Yield error
-          return; // Exit generator
-     }
-
-    var converted = 0;
-    // svg.init() // Call init inside render just in case, but ideally done earlier
-     window.svg.init(); // Ensure context exists
-
-    dest = dest || path + ".png";
-    let blob = null;
-    let url = null;
+    // Use OffscreenCanvas if supported, otherwise a hidden HTMLCanvasElement
+   if (svg.screen)
+       return // Already initialized
 
     try {
-        const svgData = FS.readFile(path, { encoding: 'utf8' }); // Read as text for SVG
-        blob = new Blob([svgData], {type: 'image/svg+xml'});
-        url = URL.createObjectURL(blob);
+        svg.screen = new OffscreenCanvas(canvas.width, canvas.height); // canvas needs to be defined globally or passed
+        console.log("Using OffscreenCanvas for SVG rendering.");
     } catch (e) {
-        console.error(`Failed to read SVG file from FS at ${path}:`, e);
-        yield new Error(`Failed to read SVG file: ${e.message}`);
-        return;
+        console.warn("OffscreenCanvas not supported or failed for SVG, falling back to hidden HTMLCanvasElement:", e);
+        svg.screen = document.createElement('canvas');
+        svg.screen.width = canvas ? canvas.width : 640; // Default size if canvas is not defined yet
+        svg.screen.height = canvas ? canvas.height : 480;
+        svg.screen.style.display = 'none'; // Keep it hidden
+        document.body.appendChild(svg.screen); // Add to body even if hidden
+    }
+
+    // Check if canvas is defined for context size
+    if (window.canvas) {
+        svg.screen.width = canvas.width;
+        svg.screen.height = canvas.height;
+    } else {
+        console.warn("SVG init: 'canvas' element not found. Using default size.");
     }
 
 
-    svg.ctx.clearRect(0, 0, svg.screen.width, svg.screen.height); // Clear the canvas
+   svg.ctx = svg.screen.getContext('2d');
+    if (!svg.ctx) {
+        console.error("Failed to get 2D context for SVG rendering canvas.");
+        // Maybe mark svg functionality as broken?
+    }
+}
 
-    let rd = new Image();
-        rd.src = url;
-
-    // Use a Promise to wait for the image to load and processing to finish
-    const renderPromise = new Promise((resolve, reject) => {
-        rd.onload = async function () {
-             try {
-                // Draw the loaded SVG image onto the canvas
-                svg.ctx.drawImage(rd, 0, 0, svg.screen.width, svg.screen.height); // Draw stretched to canvas size
-
-                // Convert the canvas content to a PNG Blob
-                window.svg.blob = await svg.screen.convertToBlob({type:"image/png"});
-
-                // Use FileReader to read the Blob data
-                const reader = new FileReader();
-                reader.onloadend = () => { // Use loadend for success or failure
-                     if (reader.error) {
-                         console.error("FileReader error reading PNG blob:", reader.error);
-                         reject(reader.error); // Reject the promise on reader error
-                         return;
-                     }
-                     try {
-                         // Write the PNG data to the virtual FS
-                        FS.writeFile(dest, new Int8Array(reader.result) );
-                        console.log("SVG conversion of", path,"to png complete :", dest);
-                        resolve(dest); // Resolve the promise with the destination path
-                     } catch (fsWriteError) {
-                         console.error(`Error writing PNG file to FS at ${dest}:`, fsWriteError);
-                         reject(fsWriteError); // Reject on FS write error
-                     }
-                };
-                reader.readAsArrayBuffer(window.svg.blob); // Start reading the blob
-
-             } catch (drawOrBlobError) {
-                 console.error("Error during SVG drawing or blob conversion:", drawOrBlobError);
-                 reject(drawOrBlobError); // Reject the promise on draw/blob error
-             } finally {
-                URL.revokeObjectURL(url); // Clean up the Blob URL immediately after Image is loaded
-                // The Blob data is now in reader.result (handled by reader.onloadend)
-                // No need to keep the blob URL alive.
-             }
-        };
-
-        rd.onerror = function (e) {
-            console.error(`Error loading SVG image from URL ${url}:`, e);
-            URL.revokeObjectURL(url); // Clean up on error too
-            reject(new Error(`Failed to load SVG image: ${e.message}`)); // Reject the promise on image load error
-        };
-    });
-
-    // The generator yields while waiting for the promise to resolve or reject
-    let result = null;
-    try {
-        result = await renderPromise;
-        converted = 1; // Mark success if promise resolved
-    } catch (e) {
-         console.error("SVG render promise failed:", e);
-         result = e; // Capture the error
-         converted = -1; // Mark failure
+// 修改这一行，添加 async 关键字
+window.svg.render =  async function * (path, dest) { // <--- ADDED async HERE
+    if (!svg.ctx) {
+         console.error("SVG rendering context not initialized. Call svg.init first or ensure canvas exists.");
+         yield new Error("SVG context not available"); // Yield error
+         return; // Exit generator
     }
 
+   var converted = 0; // This variable seems unused after the promise logic
+   // svg.init() // Call init inside render just in case, but ideally done earlier
+    window.svg.init(); // Ensure context exists
 
-    // Yield the result (destination path on success, or Error object on failure)
-    yield result;
+   dest = dest || path + ".png";
+   let blob = null;
+   let url = null;
 
-    // The generator is done.
+   try {
+       const svgData = FS.readFile(path, { encoding: 'utf8' }); // Read as text for SVG
+       blob = new Blob([svgData], {type: 'image/svg+xml'});
+       url = URL.createObjectURL(blob);
+   } catch (e) {
+       console.error(`Failed to read SVG file from FS at ${path}:`, e);
+       yield new Error(`Failed to read SVG file: ${e.message}`);
+       return;
+   }
+
+
+   let rd = new Image();
+       rd.src = url;
+
+   // Use a Promise to wait for the image to load and processing to finish
+   const renderPromise = new Promise((resolve, reject) => {
+       rd.onload = async function () { // onload callback can be async
+            try {
+               // Draw the loaded SVG image onto the canvas
+               svg.ctx.drawImage(rd, 0, 0, svg.screen.width, svg.screen.height); // Draw stretched to canvas size
+
+               // Convert the canvas content to a PNG Blob
+               window.svg.blob = await svg.screen.convertToBlob({type:"image/png"}); // Await is fine here (inside async onload)
+
+               // Use FileReader to read the Blob data
+               const reader = new FileReader();
+               reader.onloadend = () => { // Use loadend for success or failure
+                    if (reader.error) {
+                        console.error("FileReader error reading PNG blob:", reader.error);
+                        reject(reader.error); // Reject the promise on reader error
+                        return;
+                    }
+                    try {
+                        // Write the PNG data to the virtual FS
+                       FS.writeFile(dest, new Int8Array(reader.result) );
+                       console.log("SVG conversion of", path,"to png complete :", dest);
+                       resolve(dest); // Resolve the promise with the destination path
+                    } catch (fsWriteError) {
+                        console.error(`Error writing PNG file to FS at ${dest}:`, fsWriteError);
+                        reject(fsWriteError); // Reject on FS write error
+                    }
+               };
+               reader.readAsArrayBuffer(window.svg.blob); // Start reading the blob
+
+            } catch (drawOrBlobError) {
+                console.error("Error during SVG drawing or blob conversion:", drawOrBlobError);
+                reject(drawOrBlobError); // Reject the promise on draw/blob error
+            } finally {
+               URL.revokeObjectURL(url); // Clean up the Blob URL immediately after Image is loaded
+               // The Blob data is now in reader.result (handled by reader.onloadend)
+               // No need to keep the blob URL alive.
+            }
+       };
+
+       rd.onerror = function (e) {
+           console.error(`Error loading SVG image from URL ${url}:`, e);
+           URL.revokeObjectURL(url); // Clean up on error too
+           reject(new Error(`Failed to load SVG image: ${e.message}`)); // Reject the promise on image load error
+       };
+   });
+
+   // The generator yields while waiting for the promise to resolve or reject
+   let result = null;
+   try {
+       // Await is now valid here because the function is async
+       result = await renderPromise;
+       // converted = 1; // This variable is not used for the final yield
+   } catch (e) {
+        console.error("SVG render promise failed:", e);
+        result = e; // Capture the error
+        // converted = -1; // This variable is not used for the final yield
+   }
+
+
+   // Yield the result or the error.
+   // In an async generator, 'yield' pauses until the next 'next()' call,
+   // and 'await' pauses until the promise resolves/rejects.
+   // The final 'yield' sends the result back to the caller.
+   yield result; // Yield the destination path (string) on success, or the Error object on failure.
+
+   // The generator is done after the yield. A 'return' would also work but 'yield' is typical for the final value in an async generator used this way.
+   // return result; // Alternatively, could return instead of yield, but yield matches generator pattern.
 }
+// ... rest of the code ...
 
 window.svg.draw = function (path, x, y) {
      if (!svg.ctx) {

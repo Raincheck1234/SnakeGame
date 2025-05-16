@@ -1044,7 +1044,7 @@ async function feat_vtx(debug_hidden) {
         cons = 0
     }
 
-    const { WasmTerminal } = await import("./vtx.js")
+    // const { WasmTerminal } = await import("./vtx.js")
     const lines = get_terminal_lines() + cons  // including virtual get_terminal_console()
     const py = window.document.body.clientHeight
     var fntsize = Math.floor(py/lines) - 1

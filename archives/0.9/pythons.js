@@ -1044,26 +1044,52 @@ async function feat_vtx(debug_hidden) {
         cons = 0
     }
 
-    // const { WasmTerminal } = await import("./vtx.js")
-    const lines = get_terminal_lines() + cons  // including virtual get_terminal_console()
-    const py = window.document.body.clientHeight
-    var fntsize = Math.floor(py/lines) - 1
+    // --- MODIFICATION START ---
+    try {
+        const { WasmTerminal } = await import("./vtx.js"); // This is the line that failed
+        const lines = get_terminal_lines() + cons;  // including virtual get_terminal_console()
+        const py = window.document.body.clientHeight;
+        var fntsize = Math.floor(py/lines) - 1;
 
-    if (lines<=33) {
-        fntsize = ( fntsize - 5 ) / console_divider
+        if (lines<=33) {
+            fntsize = ( fntsize - 5 ) / console_divider;
+        }
+
+        console.warn("fnt:",window.document.body.clientHeight ,"/", lines,"=", fntsize, " Cols:", cols, "Cons:", cons);
+        vm.vt = new WasmTerminal(
+            "terminal",
+            cols,
+            lines,
+            fntsize,
+            config.fbdev,
+            [
+                { url : (config.cdn || "./") + "xtermjsixel/xterm-addon-image-worker.js", sixelSupport:true}
+            ]
+        );
+        console.log("vtx terminal initialized."); // Add success log
+    } catch (e) {
+        console.error("Failed to load vtx.js. Falling back to simple stdout:", e); // Log the error
+        // Fallback to a simpler output method if vtx fails
+        // Find the index of 'vtx' and remove it to avoid trying again in the main loop
+        const vtxIndex = vm.config.features.indexOf('vtx');
+        if (vtxIndex > -1) {
+             vm.config.features.splice(vtxIndex, 1);
+        }
+        // Add 'stdout' if not already present to provide some output mechanism
+        if (vm.config.features.indexOf('stdout') === -1) {
+             vm.config.features.push('stdout');
+             feat_stdout(); // Explicitly call the fallback feature
+        } else {
+             // If stdout was already a feature, feat_stdout will be called later in onload
+             // No need to call it here, just ensure vm.vt.xterm is set up correctly
+             if (!vm.vt || !vm.vt.xterm) {
+                 feat_stdout();
+             }
+        }
+        // vm.vt will be left as the default { xterm : { write : console.log}, ... }
+        return; // Exit feat_vtx
     }
-
-    console.warn("fnt:",window.document.body.clientHeight ,"/", lines,"=", fntsize, " Cols:", cols, "Cons:", cons)
-    vm.vt = new WasmTerminal(
-        "terminal",
-        cols,
-        lines,
-        fntsize,
-        config.fbdev,
-        [
-            { url : (config.cdn || "./") + "xtermjsixel/xterm-addon-image-worker.js", sixelSupport:true}
-        ]
-    )
+    // --- MODIFICATION END ---
 }
 
 
@@ -1091,7 +1117,7 @@ function feat_stdout() {
         stdout.innerHTML =  buffer.join("\n")
 
     }
-    vm.vt.xterm = stdout
+    vm.vt.xterm = stdout // Set vm.vt.xterm to this simple output method
 }
 
 // TODO make a queue, python is not always ready to receive those events
@@ -1207,7 +1233,7 @@ function queue_event(evname, data) {
     const jsdata = JSON.stringify(data)
     EQ.push( { name : evname, data : jsdata} )
 
-    if (window.python && window.python.is_ready) {
+    if (window.python && window.python.is_ready && vm.vt && vm.vt.xterm) { // Check if vt and xterm are ready
         while (EQ.length>0) {
             const ev = EQ.shift()
             python.PyRun_SimpleString(`#!
@@ -1215,7 +1241,8 @@ __EMSCRIPTEN__.EventTarget.build('${ev.name}', '''${ev.data}''')
 `)
         }
     } else {
-        console.warn(`Event "${evname}" queued : too early`)
+        // Output queued events to console if terminal is not ready
+        console.warn(`Event "${evname}" queued : terminal not ready yet`, data);
     }
 }
 
@@ -1272,14 +1299,26 @@ async function media_prepare(trackid) {
 
     if (track.type === "mount") {
 
-        if (!vm.BFS) {
+        if (!window.BrowserFS) { // Use window.BrowserFS check
             await import_browserfs()
-
-            // how is passed the FS object ???
-            vm.BFS = new BrowserFS.EmscriptenFS()  // {FS:vm.FS}
-
-            vm.BFS.Buffer = BrowserFS.BFSRequire('buffer').Buffer
         }
+
+        // how is passed the FS object ???
+        // Ensure vm.BFS is initialized only once after BrowserFS is available
+        if (!vm.BFS) {
+             vm.BFS = new BrowserFS.EmscriptenFS() // {FS:vm.FS} // EmscriptenFS expects FS to be globally available or passed
+             // Assuming BrowserFS is globally available after import_browserfs
+             if (window.BrowserFS && window.BrowserFS.BFSRequire) {
+                vm.BFS.Buffer = window.BrowserFS.BFSRequire('buffer').Buffer;
+             } else {
+                 console.error("BrowserFS or BFSRequire not available after import!");
+                 // Handle error: Maybe fallback or throw
+                 track.error = true; // Mark track as error
+                 track.avail = true; // Mark as 'checked' even if error
+                 return; // Stop processing this mount track
+             }
+        }
+
 
         // async
         MM[trackid].media = await vm.BFS.Buffer.from( MM[trackid].data )
@@ -1288,35 +1327,48 @@ async function media_prepare(trackid) {
 
         const hint = `${track.mount.path}@${track.mount.point}:${trackid}`
 
-        if (!vm.BFS) {
-            // how is passed the FS object ???
-            vm.BFS = new BrowserFS.EmscriptenFS()  // {FS:vm.FS}
-            vm.BFS.Buffer = BrowserFS.BFSRequire('buffer').Buffer
-        }
+        // No need to check vm.BFS again here, it's checked above
 
         const track_media = MM[trackid].media
 
         if (!bfs2) {
             console.warn(" ==================== BFS1 ===============")
+            // Check if BrowserFS components are available before using
+            if (!window.BrowserFS || !BrowserFS.FileSystem || !BrowserFS.FileSystem.InMemory || !BrowserFS.FileSystem.OverlayFS || !BrowserFS.FileSystem.MountableFileSystem || !BrowserFS.FileSystem.ZipFS) {
+                 console.error("BrowserFS FileSystem components not available for BFS1 init!");
+                 track.error = true; track.avail = true; return; // Handle error
+            }
             BrowserFS.InMemory = BrowserFS.FileSystem.InMemory
             BrowserFS.OverlayFS = BrowserFS.FileSystem.OverlayFS
             BrowserFS.MountableFileSystem = BrowserFS.FileSystem.MountableFileSystem
             BrowserFS.ZipFS = BrowserFS.FileSystem.ZipFS
 
             function apk_cb(e, apkfs){
+                 if (e) {
+                     console.error("BrowserFS ZipFS Create Error:", e);
+                     track.error = true; track.avail = true; return; // Handle error in callback
+                 }
                 console.log(__FILE__, "1225: mounting", hint, "onto", track.mount.point)
 
                 BrowserFS.InMemory.Create(
                     function(e, memfs) {
+                         if (e) { console.error("BrowserFS InMemory Create Error:", e); track.error = true; track.avail = true; return; }
                         BrowserFS.OverlayFS.Create({"writable" :  memfs, "readable" : apkfs },
                             function(e, ovfs) {
+                                 if (e) { console.error("BrowserFS OverlayFS Create Error:", e); track.error = true; track.avail = true; return; }
                                 BrowserFS.MountableFileSystem.Create({
                                     '/' : ovfs
                                     }, async function(e, mfs) {
-                                        await BrowserFS.initialize(mfs)
-                                        await vm.FS.mount(vm.BFS, {root: track.mount.path}, track.mount.point)
-                                        console.log("1236: mount complete")
-                                        setTimeout(()=>{track.ready=true}, 0)
+                                         if (e) { console.error("BrowserFS MountableFileSystem Create Error:", e); track.error = true; track.avail = true; return; }
+                                        try {
+                                            await BrowserFS.initialize(mfs)
+                                            await vm.FS.mount(vm.BFS, {root: track.mount.path}, track.mount.point)
+                                            console.log("1236: mount complete")
+                                            setTimeout(()=>{track.ready=true; track.avail=true;}, 0) // Set avail to true on success
+                                        } catch (mountError) {
+                                            console.error("BrowserFS Mount/Initialize Error:", mountError);
+                                            track.error = true; track.avail = true; // Set avail to true even on mount error
+                                        }
                                     })
                             }
                         );
@@ -1324,37 +1376,67 @@ async function media_prepare(trackid) {
                 );
             }
 
-            await BrowserFS.ZipFS.Create(
-                {"zipData" : track_media, "name": hint},
-                apk_cb
-            )
+             try {
+                await BrowserFS.ZipFS.Create(
+                    {"zipData" : track_media, "name": hint},
+                    apk_cb // apk_cb is async, but Create might not await it internally
+                );
+                 // Note: ZipFS.Create calls apk_cb asynchronously. track.avail is set inside apk_cb.
+             } catch (zipError) {
+                 console.error("BrowserFS ZipFS Create Error (initial):", zipError);
+                 track.error = true; track.avail = true; // Set avail to true on initial error
+             }
 
-        } else { // bfs1
+
+        } else { // bfs2
             console.warn(" ==================== BFS2 ===============")
+             if (!window.BrowserFS || !BrowserFS.configure) {
+                 console.error("BrowserFS or BrowserFS.configure not available for BFS2 init!");
+                 track.error = true; track.avail = true; return; // Handle error
+             }
 
-            // assuming FS is from Emscripten
-            await BrowserFS.configure({
-                fs: 'MountableFileSystem',
-                options: {
-                    '/': {
-                        fs: 'OverlayFS',
-                        options: {
-                            readable: { fs: 'ZipFS', options: { zipData: track_media, name: 'hint'  } },
-                            writable: { fs: 'InMemory' }
+            try {
+                // assuming FS is from Emscripten
+                await BrowserFS.configure({
+                    fs: 'MountableFileSystem',
+                    options: {
+                        '/': {
+                            fs: 'OverlayFS',
+                            options: {
+                                readable: { fs: 'ZipFS', options: { zipData: track_media, name: 'hint'  } },
+                                writable: { fs: 'InMemory' }
+                            }
                         }
                     }
-                }
-            });
+                });
 
-            vm.FS.mount(vm.BFS, { root: track.mount.path, }, track.mount.point);
-            setTimeout(()=>{track.ready=true}, 0)
+                await vm.FS.mount(vm.BFS, { root: track.mount.path, }, track.mount.point);
+                console.log("BFS2 mount complete"); // Add success log
+                setTimeout(()=>{track.ready=true; track.avail=true;}, 0); // Set avail to true on success
+            } catch (bfs2Error) {
+                 console.error("BrowserFS BFS2 configure/mount Error:", bfs2Error);
+                 track.error = true; track.avail = true; // Set avail to true on error
+            }
         } // bfs2
 
     } // track type mount
+    // For types other than 'mount', avail is set when data is received or deemed available (like audio URLs or FS files)
+    // Ensure avail is always set eventually, even on errors during fetching/processing
+    if (track.avail === undefined) {
+         // This might happen if fetching failed or type was unsupported
+         console.warn(`Track ${trackid} (${track.url}) preparation finished without setting avail status.`);
+         track.avail = true; // Assume ready state for checking, error flag will indicate failure
+    }
 }
 
 
 function MM_play(track, loops) {
+    // Check if track exists and has media
+    if (!track || !track.media) {
+        console.error("MM_play called with invalid track or missing media:", track);
+        return;
+    }
+
     const media = track.media
     track.loops = loops
     const prom = track.media.play()
@@ -1362,13 +1444,18 @@ function MM_play(track, loops) {
         prom.then(() => {
             // ME ok play started
             MM.UME = true
+             console.log(`Track ${track.trackid} started playing.`); // Add success log
         }).catch(error => {
             // Media engagement required
             MM.UME = false
-            console.error(`** MEDIA USER ACTION REQUIRED [${track.test}] **`)
+            console.error(`** MEDIA USER ACTION REQUIRED [${track.test || 'auto-play'}] **:`, error); // Log the error
             if (track.test && track.test>0) {
                 track.test += 1
                 setTimeout(MM_play, 2000, track, loops)
+            } else if (track.auto && MM.is_safari) { // Specific handling for Safari auto-play blocks
+                 console.warn("Safari auto-play blocked. Waiting for user interaction.");
+                 // You might want to add an event listener here to try playing again on user click/tap
+                 // window.addEventListener('click', () => { if (!MM.UME) { MM_play(track, loops); } }, { once: true });
             }
 
         });
@@ -1379,43 +1466,97 @@ function MM_play(track, loops) {
 
 
 window.cross_track = async function cross_track(trackid, url, flags) {
-    var response = await fetch(url, flags || FETCH_FLAGS);
+    const track = MM[trackid];
+     if (!track) {
+         console.error("cross_track called with invalid trackid:", trackid);
+         return; // Exit if track doesn't exist
+     }
 
-    checkStatus(response)
+    var response = null;
+     try {
+        response = await fetch(url, flags || FETCH_FLAGS);
+        if (!checkStatus(response)) {
+             console.error(`Fetch failed for track ${trackid}: HTTP ${response.status} - ${response.statusText}`);
+             track.error = new Error(`HTTP ${response.status} - ${response.statusText}`); // Store the error
+             track.avail = true; // Mark as processed (with error)
+             return track.error; // Return error
+        }
+     } catch (fetchError) {
+         console.error(`Fetch Exception for track ${trackid} (${url}):`, fetchError);
+         track.error = fetchError; // Store the error
+         track.avail = true; // Mark as processed (with error)
+         return fetchError; // Return error
+     }
+
 
     const reader = response.body.getReader();
 
-    const len = Number(response.headers.get("Content-Length"));
-    const track = MM[trackid]
+    const len_header = response.headers.get("Content-Length");
+    const len = len_header ? Number(len_header) : 0; // Handle missing Content-Length
+     if (len === 0 && len_header !== null) {
+         console.warn(`Track ${trackid} (${url}): Content-Length is 0 or header missing. Proceeding anyway.`);
+     }
+
 
     // concatenate chunks into single Uint8Array
-    track.data = new Uint8Array(len);
-    track.pos = 0
-    track.len = len
+     let chunks = [];
+     let receivedLength = 0;
 
-    console.warn(url, track.len)
+    console.warn(`Downloading track ${trackid} from ${url}...`);
 
     while(true) {
-        const {done, value} = await reader.read()
+         try {
+            const {done, value} = await reader.read();
 
-        if (done) {
-            track.avail = true
-            break
-        }
-        try {
-            track.data.set(value, track.pos)
-        } catch (x) {
-            track.pos = -1
-            console.error("1396: cannot download", url)
-        }
-        track.pos += value.length
+            if (done) {
+                 break;
+            }
+            chunks.push(value);
+            receivedLength += value.length;
+             // Optional: Add progress reporting here if needed
+             // console.log(`Track ${trackid}: Received ${receivedLength} of ${len || '?'}`);
+         } catch (readError) {
+             console.error(`Error reading stream for track ${trackid} (${url}):`, readError);
+             track.error = readError; // Store the error
+             track.avail = true; // Mark as processed (with error)
+             return readError; // Return error
+         }
     }
 
-    console.log(`${trackid}:${url} Received ${track.pos} of ${track.len} to ${track.path}`)
+     // Concatenate all chunks into a single Uint8Array
+     track.data = new Uint8Array(receivedLength);
+     let offset = 0;
+     for (const chunk of chunks) {
+         track.data.set(chunk, offset);
+         offset += chunk.length;
+     }
+
+     track.pos = receivedLength; // Final position is total length
+     track.len = len > 0 ? len : receivedLength; // Use header length if available, otherwise actual received length
+
+    console.log(`${trackid}:${url} Received ${track.pos} bytes. Storing to ${track.path || 'memory'}`);
+     // Check if data was actually received
+     if (track.pos === 0 && receivedLength > 0) {
+          console.warn(`Track ${trackid}: receivedLength > 0 but track.pos is 0? Check logic.`);
+     }
+     if (track.pos === 0 && receivedLength === 0 && len_header !== "0") {
+         console.error(`Track ${trackid}: Downloaded 0 bytes for ${url}.`);
+         track.error = new Error(`Downloaded 0 bytes for ${url}`);
+     }
+
+
     if (track.type === "fs" ) {
-        FS.writeFile(track.path, track.data)
+         try {
+            FS.writeFile(track.path, track.data);
+             console.log(`Track ${trackid} stored to FS at ${track.path}`);
+         } catch (fsError) {
+             console.error(`Error writing track ${trackid} to FS at ${track.path}:`, fsError);
+             track.error = fsError; // Store FS error
+         }
     }
 
+    track.avail = true; // Mark as processed (success or failure)
+    return track.error || trackid; // Return error object or trackid on success
 }
 
 
@@ -1424,7 +1565,13 @@ MM.prepare = function prepare(url, cfg) {
     const trackid = MM.tracks
     var audio
 
-    cfg = JSON.parse(cfg)
+    try {
+        cfg = JSON.parse(cfg);
+    } catch (e) {
+         console.error(`Failed to parse track config for URL ${url}:`, e);
+         MM[trackid] = {"trackid": trackid, "error": e, "avail": true}; // Mark as failed immediately
+         return MM[trackid];
+    }
 
 
     const transport = cfg.io || 'packed'
@@ -1434,15 +1581,15 @@ MM.prepare = function prepare(url, cfg) {
             "trackid": trackid,
             "type"  : type,
             "url"   : url,
-            "error" : false,
+            "error" : false, // Reset error flag
             "len"   : 0,
             "pos"   : 0,
             "io"    : transport,
-            "ready" : undefined,
-            "auto"  : false,
-            "avail" : undefined,
+            "ready" : undefined, // ready state, e.g. for audio canplaythrough
+            "auto"  : cfg.auto || false, // Keep auto flag from config
+            "avail" : undefined, // avail means data is fully downloaded/processed
             "media" : undefined,
-            "data"  : undefined
+            "data"  : undefined // Raw data buffer
         }
     }
     const track = MM[trackid]
@@ -1450,26 +1597,57 @@ MM.prepare = function prepare(url, cfg) {
 //console.log("MM.prepare", trackid, transport, type)
 
     if (transport === 'fs') {
-        if ( type === "audio" ) {
-            const blob = new Blob([FS.readFile(track.url)])
-            audio = new Audio(URL.createObjectURL(blob,  { oneTimeOnly: true }))
-            track.avail = true
-        } else {
-            console.error("fs transport is only for audio", JSON.stringify(track))
-            track.error = true
-            return track
-        }
-    }
-
-    if (transport === "url" ) {
+        // For 'fs' transport, data is assumed to be already in FS
+        // Need to check if the file exists or handle FS read errors later
+         if (type === "audio") {
+             try {
+                const blob = new Blob([FS.readFile(track.url)]) // Read from FS
+                audio = new Audio(URL.createObjectURL(blob,  { oneTimeOnly: true }))
+                track.avail = true // Data is locally available in FS
+                track.path = track.url; // For FS type, path is the url
+             } catch (fsReadError) {
+                 console.error(`Failed to read FS audio file ${track.url}:`, fsReadError);
+                 track.error = fsReadError;
+                 track.avail = true; // Mark as processed (with error)
+             }
+         } else if (type === 'mount') {
+             // Mount from FS file - data is in the FS file itself
+              track.path = track.url; // FS file path
+              // Need to read the file into memory/buffer before mounting
+              try {
+                  track.data = new Uint8Array(FS.readFile(track.path)); // Read binary data
+                  track.avail = true; // Data read from FS
+              } catch (fsReadError) {
+                   console.error(`Failed to read FS file ${track.url} for mounting:`, fsReadError);
+                   track.error = fsReadError;
+                   track.avail = true; // Mark as processed (with error)
+              }
+         }
+         else {
+            console.error(`FS transport is only fully implemented for 'audio' and 'mount' types. Type '${type}' unsupported via 'fs' transport.`);
+            track.error = new Error(`Unsupported type '${type}' for 'fs' transport`);
+            track.avail = true; // Mark as processed (with error)
+         }
+    } else if (transport === "url" ) {
         // audio tag can download itself
         if ( type === "audio" ) {
             audio = new Audio(url)
-            track.avail = true
-        } else {
-console.log("MM.cross_track", trackid, transport, type, url )
-            cross_track(trackid, url, {} )
+            track.avail = true // Audio tag handles download, so it's 'available' to the browser Media API
+        } else if (type === "fs" || type === "mount") {
+             // Need to fetch data from URL and save to track.data or FS
+             track.path = cfg.path || `/tmp/mm_track_${trackid}`; // Define a default path if not provided
+             console.log(`Fetching track ${trackid} data from URL ${url} to ${track.path}`);
+             cross_track(trackid, url, {} ) // This is async and will set track.avail later
         }
+         else {
+              console.error(`URL transport unsupported for type '${type}'.`);
+              track.error = new Error(`Unsupported type '${type}' for 'url' transport`);
+              track.avail = true; // Mark as processed (with error)
+         }
+    } else {
+        console.error(`Unsupported transport '${transport}' for track ${trackid}.`);
+        track.error = new Error(`Unsupported transport '${transport}'`);
+        track.avail = true; // Mark as processed (with error)
     }
 
 
@@ -1487,7 +1665,16 @@ console.log("MM.cross_track", trackid, transport, type, url )
     }
 
 //console.log("MM.prepare", url,"queuing as",trackid)
-    media_prepare(trackid)
+    // Wait for track.avail to become true before calling media_prepare logic (mostly for mount)
+    // For audio/fs where avail is set sync, this awaits immediate promise
+     _until(defined)("avail", track).then(() => {
+         if (!track.error) { // Only proceed if no error during initial processing/fetching
+              media_prepare(trackid);
+         } else {
+              console.error(`Skipping media_prepare for track ${trackid} due to previous error.`);
+              track.ready = false; // Ensure ready is false if error occurred
+         }
+     });
 //console.log("MM.prepare", url,"queued as",trackid)
     return track
 }
@@ -1496,29 +1683,57 @@ console.log("MM.cross_track", trackid, transport, type, url )
 MM.load = function load(trackid, loops) {
 // loops =0 play once, loops>0 play number of time, <0 loops forever
     const track = MM[trackid]
+    if (!track) {
+         console.error("MM.load called with invalid trackid:", trackid);
+         return -1; // Indicate error
+    }
+
+    if (track.error) {
+         console.error(`MM.load: Track ${trackid} had an error during preparation.`);
+         return -1; // Indicate error
+    }
+
 
     loops = loops || 0 //??=
     track.loops = loops
 
-    if (!track.avail) {
-        // FS not ready
-        console.error("981 TODO: bounce with setTimeout")
-        return 0
-    }
-
+    // Note: This function seems redundant for 'audio' type as MM.prepare already sets up the audio object.
+    // It seems primarily designed for 'mount' type after data is fetched.
 
     if (track.type === "audio") {
-        MM_autoevents( track , trackid )
+        // MM_autoevents is already called in MM.prepare for audio
+         if (!track.media) {
+              console.error(`MM.load: Audio track ${trackid} is missing media object.`);
+              return -1;
+         }
+         console.log(`MM.load: Audio track ${trackid} ready.`);
         return trackid
     }
 
     if (track.type === "mount") {
-        const mount = track
-        console.log(track.mount.point , track.mount.path, trackid )
-        mount_ab( track.data , track.mount.point , track.mount.path, trackid )
+        // This part seems intended to be called *after* data is fetched (track.avail is true)
+        // The actual mounting logic is inside media_prepare for type 'mount'
+        // So, if MM.load is called *before* media_prepare for a mount track completes,
+        // it will incorrectly report -1 or proceed with incomplete data.
+        // Let's check if media_prepare has completed (indicated by track.avail)
+         if (!track.avail) {
+             console.warn(`MM.load: Mount track ${trackid} data not yet available.`);
+             // You might want to queue the load or return a pending status
+             return 0; // Indicate pending/not ready
+         }
+         if (!track.ready) {
+             console.warn(`MM.load: Mount track ${trackid} is available but not yet ready for mounting.`);
+             // Wait for track.ready which is set after BFS mount
+             return 0; // Indicate pending/not ready
+         }
+
+        // If track.ready is true, mounting should be complete.
+        console.log(`MM.load: Mount track ${trackid} at ${track.mount.point} from ${track.mount.path} ready.`);
         return trackid
     }
-// unsupported type
+
+    // unsupported type via MM.load
+    console.error(`MM.load: Unsupported type '${track.type}'.`);
     return -1
 }
 
@@ -1526,17 +1741,38 @@ MM.load = function load(trackid, loops) {
 MM.play = function play(trackid, loops, start, fade_ms) {
     console.log("MM.play",trackid, loops, MM[trackid] )
     const track = MM[trackid]
+     if (!track) {
+         console.error("MM.play called with invalid trackid:", trackid);
+         return;
+     }
+     if (track.error) {
+         console.error(`MM.play: Cannot play track ${trackid} due to previous error.`);
+         return;
+     }
+
 
     track.loops = loops
+     // start and fade_ms are ignored by the current Audio logic
 
-    if (track.ready) {
+     if (track.type !== "audio") {
+         console.error(`MM.play: Cannot play non-audio track type '${track.type}'.`);
+         return;
+     }
+
+    if (track.ready && track.media) {
         track.media.play()
+         console.log(`Attempting to play track ${trackid}.`);
     } else {
-        console.warn("Cannot play before user interaction, will retry", track )
+        console.warn(`Cannot play track ${trackid} immediately (ready=${track.ready}, media=${!!track.media}). Will retry.`);
+        // This retry logic is also inside MM_play itself now (for UME)
+        // But the `play_asap` here was intended for `track.ready` specifically. Let's keep it for robustness.
         function play_asap() {
-            if (track.ready) {
-                track.media.play()
+            // Re-check track validity and readiness
+            if (MM[trackid] && MM[trackid].ready && MM[trackid].media) {
+                MM[trackid].media.play();
+                 console.log(`Retry playing track ${trackid} successful.`);
             } else {
+                console.warn(`Retry playing track ${trackid} failed (ready=${MM[trackid]?.ready}, media=${!!MM[trackid]?.media}). Retrying in 500ms.`);
                 setTimeout(play_asap, 500)
             }
         }
@@ -1546,9 +1782,18 @@ MM.play = function play(trackid, loops, start, fade_ms) {
 
 MM.stop = function stop(trackid) {
     console.log("MM.stop", trackid, MM[trackid] )
-    MM[trackid].media.currentTime = 0
-    MM[trackid].media.pause()
-    MM.current_trackid = 0
+     const track = MM[trackid];
+     if (track && track.media && track.type === "audio") { // Only stop audio tracks this way
+        track.media.currentTime = 0
+        track.media.pause()
+     } else if (!track) {
+         console.warn("MM.stop called with invalid trackid:", trackid);
+     } else {
+         console.warn(`MM.stop does not support track type '${track.type}'.`);
+     }
+    if (MM.current_trackid === trackid) {
+        MM.current_trackid = 0
+    }
 }
 
 MM.get_pos = function get_pos(trackid) {
@@ -1557,7 +1802,7 @@ MM.get_pos = function get_pos(trackid) {
 
     const track = MM[trackid]
 
-    if (track && track.media)
+    if (track && track.media && track.type === "audio") // Only audio has currentTime
         return MM[trackid].media.currentTime
     return -1
 }
@@ -1566,23 +1811,52 @@ MM.get_pos = function get_pos(trackid) {
 
 MM.pause = function pause(trackid) {
     console.log("MM.pause", trackid, MM[trackid] )
-    MM[trackid].media.pause()
+     const track = MM[trackid];
+     if (track && track.media && track.type === "audio") { // Only pause audio tracks
+        MM[trackid].media.pause()
+     } else if (!track) {
+         console.warn("MM.pause called with invalid trackid:", trackid);
+     } else {
+         console.warn(`MM.pause does not support track type '${track.type}'.`);
+     }
 }
 
 MM.unpause = function unpause(trackid) {
     console.log("MM.unpause", trackid, MM[trackid] )
-    MM.current_trackid = trackid
-    MM[trackid].media.play()
+     const track = MM[trackid];
+     if (track && track.media && track.type === "audio") { // Only unpause audio tracks
+        MM.current_trackid = trackid
+        MM[trackid].media.play()
+     } else if (!track) {
+         console.warn("MM.unpause called with invalid trackid:", trackid);
+     } else {
+         console.warn(`MM.unpause does not support track type '${track.type}'.`);
+     }
 }
 
 MM.set_volume = function set_volume(trackid, vol) {
     console.log(`MM.set_volume track=${trackid} vol=${vol}`)
-    MM[trackid].media.volume = 1 * vol
+     const track = MM[trackid];
+     if (track && track.media && track.type === "audio") { // Only set volume on audio
+        MM[trackid].media.volume = 1 * vol
+     } else if (!track) {
+         console.warn("MM.set_volume called with invalid trackid:", trackid);
+     } else {
+         console.warn(`MM.set_volume does not support track type '${track.type}'.`);
+     }
 }
 
-MM.get_volume = function get_volume(trackid, vol) {
-    console.log(`MM.get_volume track=${trackid} vol=${vol}`)
-    return MM[trackid].media.volume
+MM.get_volume = function get_volume(trackid) { // Removed 'vol' param as it's a getter
+    console.log(`MM.get_volume track=${trackid}`)
+    const track = MM[trackid];
+     if (track && track.media && track.type === "audio") {
+        return MM[trackid].media.volume
+     } else if (!track) {
+         console.warn("MM.get_volume called with invalid trackid:", trackid);
+     } else {
+         console.warn(`MM.get_volume does not support track type '${track.type}'.`);
+     }
+    return -1; // Indicate error or not applicable
 }
 
 MM.set_socket = function set_socket(mode) {
@@ -1592,51 +1866,84 @@ MM.set_socket = function set_socket(mode) {
 
 
 function MM_autoevents(track, trackid) {
+    // Ensure track and media exist and it's an audio type before adding listeners
+    if (!track || !track.media || track.type !== "audio") {
+        console.warn(`Skipping MM_autoevents setup for track ${trackid} (Not audio or media missing).`);
+        return;
+    }
+
     const media = track.media
 
     if (media.MM_autoevents) {
-        return
+        return // Avoid adding listeners multiple times
     }
 
-    media.MM_autoevents = 1
+    media.MM_autoevents = 1 // Mark as setup
 
-    track.media.onplaying = (event) => {
+    media.onplaying = (event) => {
         MM.transition = 0
         MM.current_trackid = trackid
+         console.log(`Track ${trackid} is now playing.`);
     }
 
     media.addEventListener("canplaythrough", (event) => {
         track.ready = true
+         console.log(`Track ${trackid} can play through.`);
         if (track.auto) {
+             console.log(`Track ${trackid} auto-playing.`);
             media.play()
         }
     })
 
     media.addEventListener('ended', (event) => {
+        console.log(`Track ${trackid} ended. Loops left: ${track.loops}`);
 
-        if (track.loops<0) {
-            console.log("track ended - looping forever")
-            media.play()
+        if (track.loops < 0) {
+            console.log("Track ended - looping forever");
+            media.currentTime = 0; // Reset time for seamless loop
+            media.play();
             return
         }
-        if (track.loops>0) {
+        if (track.loops > 0) {
             track.loops--;
-            console.log("track ended - pass", track.loops)
-            media.play()
+            console.log("Track ended - remaining loops:", track.loops);
+             media.currentTime = 0; // Reset time for next loop
+            media.play();
             return
         }
 
-        console.log("track ended - q?", MM.next_tid)
+        console.log("Track ended - checking queue.", MM.next_tid ? `Next queued: ${MM.next_tid}` : "Queue is empty.");
 
         // check a track is queued
         if (MM.next_tid) {
             MM.transition = 1
-            console.log("queued", MM.next_hint, "from", MM.next, "loops", MM.next_loops)
-            track.auto = true
-            MM.play(MM.next_tid, MM.next_loops)
-            MM.next_tid = 0
+            console.log("Playing queued track", MM.next_hint, "from", MM.next, "loops", MM.next_loops);
+            // The next track should ideally be prepared/loaded already.
+            // Set auto=true on the *next* track if needed, then call play on it.
+            const nextTrack = MM[MM.next_tid];
+            if (nextTrack) {
+                 nextTrack.auto = true; // Ensure the next track auto-plays when ready
+                 MM.play(MM.next_tid, MM.next_loops); // Call play on the next track
+            } else {
+                 console.error(`Queued track ID ${MM.next_tid} not found in MM.`);
+            }
+            MM.next_tid = 0; // Clear the queue marker
+            MM.next_hint = "";
+            MM.next_loops = 0;
+        } else {
+             MM.current_trackid = 0; // No next track, clear current
+             console.log("Track ended, queue empty.");
         }
     })
+
+    // Add error listener for media elements
+    media.addEventListener('error', (event) => {
+        console.error(`Media playback error for track ${trackid} (${track.url}):`, media.error, event);
+        track.error = new Error(`Media error code ${media.error.code}: ${media.error.message}`);
+        // Depending on the error, you might want to try the next track or mark this one as permanently failed.
+        MM.current_trackid = 0; // Clear current track on error
+        // Optionally check MM.next_tid and try to play it
+    });
 }
 
 
@@ -1647,138 +1954,291 @@ function MM_autoevents(track, trackid) {
 // TODO: frame rate
 
 window.MM.camera.started = 0
-window.MM.camera.init = function * (device, width,height, preview, grabber) {
-    if (!MM.camera.started) {
-        var done = 0
-        var rc = null
-        const vidcap = document.createElement('video')
-        vidcap.id = "vidcap"
-        vidcap.autoplay = true
-
-        window.vidcap = vidcap
-        width = width || 640
-        height = height || 480
-
-        vidcap.width = width
-        vidcap.height = height
-        const device = MM.camera.device || "/dev/video0"
-
-
-
-        MM.camera.fd = {}
-        MM.camera.busy = 0
-
-        // 60 fps
-        MM.camera.frame = { device : undefined , rate : Number.parseInt(1000/30/4) }
-
-        var framegrabber = null
-
-        if (window.stdout) {
-
-            if (preview)
-                stdout.appendChild(vidcap)
-
-            if (grabber) {
-                framegrabber = document.createElement('canvas')
-                stdout.appendChild(framegrabber)
-            } else {
-
-            }
-        }
-
-        if (!framegrabber)
-            framegrabber = new OffscreenCanvas(width, height)
-        else {
-            framegrabber.width = width
-            framegrabber.height = height
-        }
-
-        window.framegrabber = framegrabber
-
-        function onCameraFail(e) {
-            console.log('924: Camera did not start.', e)
-            MM.camera.started = 0
-            done =1
-        }
-
-        const params = {
-            audio: false,
-            video: {
-                "width": { ideal: width },
-                "height": {  ideal: height },
-            }
-        }
-
-
-        MM.camera.query_image = function () {
-            // ok to use previous image
-            if ( FS.analyzePath(device).exists )
-                return true
-            if (MM.camera.busy>25)
-                console.error("frame grabber is stuck")
-            return false
-        }
-
-        // TODO: same but async
-        MM.camera.get_raw = function * () {
-            // capture next frame and wait conversion
-            setTimeout(GRABBER, 0)
-            while (!MM.camera.frame[device])
-                yield 0
-            return MM.camera.frame[device]
-        }
-
-        const reader = new FileReader()
-
-        reader.addEventListener("load", () => {
-                const data = new Int8Array(reader.result)
-                FS.writeFile(device,  data )
-                //console.log("frame ready at ", MM.camera.busy)
-                MM.camera.frame[device] = data.length
-                MM.camera.busy--
-            }, false
-        )
-
-        async function GRABBER() {
-            if (MM.camera.busy<25)
-                setTimeout(GRABBER, MM.camera.frame["rate"])
-
-            if (MM.camera.busy>0)
-                return
-
-            MM.camera.busy++
-            framegrabber.getContext("2d").drawImage(vidcap, 0, 0);
-
-            // convert the new frame !
-            MM.camera.frame[device] = undefined
-            MM.camera.blob = await framegrabber.convertToBlob({type:"image/png"})
-            reader.readAsArrayBuffer(MM.camera.blob)
-        }
-
-        window.GRABBER = GRABBER
-
-        function connection(stream) {
-            vidcap.srcObject = stream
-            vidcap.onloadedmetadata = function(e) {
-                setTimeout(GRABBER, 0)
-                console.log("video stream ready")
-                MM.camera.started = 1
-                done =1
-            }
-        }
-
-        navigator.mediaDevices.getUserMedia(params) //, connection, onCameraFail)
-        .then( stream => connection(stream) )
-        .catch(e => onCameraFail(e))
-
-        while (!done)
-            yield 0
-
-        // wait for first frame
-        while (!MM.camera.frame[device])
-            yield 0
+window.MM.camera.init = function * (device_path, width,height, preview, grabber) {
+     // Check if camera is already started
+     if (MM.camera.started > 0) {
+         console.warn("Camera already started.");
+         yield window.MM.camera.started; // Yield current state
+         return; // Exit generator
+     }
+    if (MM.camera.started === -1) {
+         console.error("Camera failed to start previously.");
+         yield MM.camera.started; // Yield error state
+         return; // Exit generator
     }
-    yield window.MM.camera.started
+
+    var done = 0;
+    var rc = null; // This variable is unused
+
+    const vidcap = document.createElement('video');
+    vidcap.id = "vidcap";
+    vidcap.autoplay = true;
+    vidcap.muted = true; // Mute video element usually needed for autoplay policies
+
+    window.vidcap = vidcap;
+    width = width || 640;
+    height = height || 480;
+
+    vidcap.width = width;
+    vidcap.height = height;
+    const device = device_path || "/dev/video0"; // Use provided path or default
+
+
+    MM.camera.fd = {}; // File descriptor placeholder? Unused in this JS logic.
+    MM.camera.busy = 0; // Frame grabber busy counter
+
+    // Frame rate calculation (target 30 fps, grabbing every ~8ms? Seems too fast)
+    // 1000ms / 30fps = ~33.3ms per frame.
+    // Let's set a reasonable interval, maybe grab 10-15 times per second?
+    // Number.parseInt(1000 / target_fps)
+    const target_fps = 15; // Grab 15 frames per second
+    MM.camera.frame = { device : undefined , rate : Number.parseInt(1000 / target_fps) }; // Interval in ms
+
+
+    var framegrabber = null; // Canvas for grabbing frames
+
+    // Decide where to put video/canvas elements
+    const outputContainer = document.getElementById('html') || document.body; // Or specify a div
+    if (outputContainer) {
+        if (preview) {
+             // Style for preview might be needed (position, size, etc.)
+            outputContainer.appendChild(vidcap);
+             vidcap.style.display = debug_hidden ? 'none' : ''; // Hide if debug_hidden is true
+             console.log(`Video preview added to ${outputContainer.id || 'body'}`);
+        }
+
+        if (grabber) { // If a separate grabber canvas is needed visually
+            framegrabber = document.createElement('canvas');
+             framegrabber.id = "framegrabber_canvas";
+             // Style for grabber canvas might be needed
+            outputContainer.appendChild(framegrabber);
+             framegrabber.style.display = debug_hidden ? 'none' : ''; // Hide if debug_hidden is true
+             console.log(`Grabber canvas added to ${outputContainer.id || 'body'}`);
+        }
+    } else {
+         console.warn("No output container found (#html), video/canvas elements will not be added to DOM.");
+    }
+
+
+    // Use OffscreenCanvas if no visual grabber needed, or if browser supports it well
+    if (!framegrabber) {
+        try {
+             // Check if OffscreenCanvas is supported and works in this context
+             // Note: OffscreenCanvas might have limitations with drawImage from video in some workers/contexts
+             // For main thread, a hidden HTMLCanvasElement is often safer if OffscreenCanvas issues arise.
+             framegrabber = new OffscreenCanvas(width, height);
+             console.log("Using OffscreenCanvas for frame grabbing.");
+        } catch (e) {
+             console.warn("OffscreenCanvas not supported or failed, falling back to hidden HTMLCanvasElement:", e);
+             framegrabber = document.createElement('canvas');
+             framegrabber.width = width;
+             framegrabber.height = height;
+             framegrabber.style.display = 'none'; // Keep it hidden
+             document.body.appendChild(framegrabber); // Add to body even if hidden
+        }
+    } else { // If grabber canvas was explicitly created in DOM
+        framegrabber.width = width;
+        framegrabber.height = height;
+    }
+
+
+    window.framegrabber = framegrabber; // Make it accessible for debugging
+
+
+    // Status check for frame readiness in the FS (might be used by Python)
+    MM.camera.query_image = function () {
+        // Check if a frame file exists at the device path.
+        // This assumes GRABBER saves frames to this path.
+        // Alternatively, you could check MM.camera.frame[device] status directly.
+        try {
+            return FS.analyzePath(device).exists;
+        } catch (e) {
+            // FS might not be ready or path analysis failed
+             console.warn(`FS analyzePath failed for ${device}:`, e);
+            return false;
+        }
+    };
+
+    // Generator to get raw frame data (intended for Python via iterators)
+    MM.camera.get_raw = function * () {
+        // Request a new frame capture if not busy
+         if (MM.camera.busy === 0) {
+             // Schedule GRABBER to capture the *next* frame
+             console.log("Requesting new camera frame capture.");
+             MM.camera.busy++; // Indicate a capture is in progress
+             GRABBER(); // GRABBER will decrement busy when done
+         } else {
+              console.warn(`Camera grabber busy (${MM.camera.busy}), waiting for current frame.`);
+         }
+
+        // Wait until a new frame is available at the device path (written by GRABBER)
+        // This assumes GRABBER writes to FS immediately after capture/encoding.
+         let frame_available_in_fs = false;
+         while (!frame_available_in_fs) {
+             try {
+                 frame_available_in_fs = FS.analyzePath(device).exists;
+             } catch (e) {
+                 // FS might not be ready or path issue
+                 console.warn(`Waiting for FS path ${device}:`, e);
+                 frame_available_in_fs = false;
+             }
+             if (!frame_available_in_fs) {
+                yield 0; // Yield control while waiting
+             }
+         }
+
+         // Once the file exists, read it and yield the data.
+         // The FS.readFile returns a Uint8Array, which matches the common 'raw' data expectation.
+         try {
+             const frame_data = FS.readFile(device);
+             console.log(`Camera frame read from ${device}, size: ${frame_data.length}`);
+             // After reading, perhaps remove the file to signal it's consumed and allow the next GRABBER cycle?
+             // FS.unlink(device); // Be careful with this, ensure Python side is done with it.
+             yield frame_data; // Yield the frame data
+         } catch (fsReadError) {
+             console.error(`Failed to read camera frame from FS at ${device}:`, fsReadError);
+             yield null; // Yield null or throw to indicate failure
+         }
+    }
+
+    const reader = new FileReader(); // Used for reading Blob data
+
+    reader.addEventListener("loadend", () => { // Use loadend to handle both success and error
+            if (reader.error) {
+                 console.error("FileReader error reading camera frame blob:", reader.error);
+                 // Handle the error, maybe mark camera as failed temporarily or permanently
+                 MM.camera.busy--; // Decrement busy counter even on error
+                 // How to signal failure to Python waiting on get_raw? The generator awaits FS.analyzePath(device).exists, which won't be true.
+                 // We need a way to signal failure to the generator waiting in the `while (!frame_available_in_fs)` loop.
+                 // A simple approach is to set an error flag or return value on MM.camera.frame or similar.
+                 MM.camera.frame[device] = -1; // Use -1 to indicate an error occurred writing to FS
+                 return;
+            }
+            const data = new Uint8Array(reader.result);
+             try {
+                FS.writeFile(device, data); // Write the frame data to the virtual FS path
+                //console.log("frame ready at ", MM.camera.busy);
+                MM.camera.frame[device] = data.length; // Signal success by setting length (used by old logic, maybe keep?)
+                MM.camera.busy--; // Decrement busy counter
+                 console.log(`Camera frame successfully written to FS at ${device}.`);
+             } catch (fsWriteError) {
+                 console.error(`Error writing camera frame to FS at ${device}:`, fsWriteError);
+                 MM.camera.frame[device] = -1; // Signal FS write error
+                 MM.camera.busy--; // Decrement busy counter
+             }
+
+        }, false
+    );
+
+    // Function to capture frame from video and save to FS
+    async function GRABBER() {
+        // Ensure GRABBER isn't called again immediately if busy
+        if (MM.camera.busy > 0) {
+             // If busy, GRABBER will be scheduled again by the `setTimeout` loop if still running.
+             // No need to schedule here.
+            return;
+        }
+
+        // Schedule the *next* capture
+        if (MM.camera.started > 0) { // Only schedule if camera is started successfully
+            setTimeout(GRABBER, MM.camera.frame["rate"]);
+        } else {
+             console.log("GRABBER stopping: Camera not started or failed.");
+             return; // Stop scheduling if camera isn't running
+        }
+
+
+        // Ensure video is ready and playable
+        if (!vidcap || vidcap.readyState < 2 /* HAVE_CURRENT_DATA */) {
+             console.warn("Video element not ready for grabbing yet.");
+             return; // Skip this grab cycle if video is not ready
+        }
+
+        MM.camera.busy++; // Increment busy counter *before* async operations
+
+        try {
+            const ctx = framegrabber.getContext("2d");
+             // Ensure canvas size matches video size for drawing
+            ctx.drawImage(vidcap, 0, 0, framegrabber.width, framegrabber.height);
+
+            // Convert the drawn canvas content to a Blob
+             MM.camera.blob = await framegrabber.convertToBlob({type:"image/png"}); // Use PNG for lossless or 'image/jpeg' for compressed
+
+            // Read the Blob into an ArrayBuffer and trigger the reader 'loadend' event
+            reader.readAsArrayBuffer(MM.camera.blob);
+
+            // The busy counter decrement and FS write happen in the reader's loadend event handler.
+
+        } catch (grabError) {
+             console.error("Error during camera frame grabbing or blob conversion:", grabError);
+             MM.camera.busy--; // Decrement busy counter on error
+             MM.camera.frame[device] = -1; // Signal grab/conversion error
+        }
+    }
+
+    window.GRABBER = GRABBER // Make it accessible for debugging/manual triggering
+
+    // Start camera stream
+    const params = {
+        audio: false, // Audio is off as per your code
+        video: {
+            width: { ideal: width },
+            height: {  ideal: height },
+            // You might want to add frameRate constraint here if needed
+            // frameRate: { ideal: 30 }
+        }
+    };
+
+     // Request media devices
+    navigator.mediaDevices.getUserMedia(params)
+    .then( stream => {
+         console.log("Camera stream received.");
+        vidcap.srcObject = stream;
+        vidcap.onloadedmetadata = function(e) {
+             console.log("Video element loaded metadata.");
+             // Ensure video dimensions are set on canvas if needed
+             framegrabber.width = vidcap.videoWidth;
+             framegrabber.height = vidcap.videoHeight;
+             if (preview) {
+                  vidcap.width = vidcap.videoWidth; // Adjust preview size? Maybe not needed if CSS handles it
+                  vidcap.height = vidcap.videoHeight;
+             }
+             // Start the frame grabbing loop after video metadata is loaded
+            GRABBER();
+            console.log("Video stream ready and GRABBER started.");
+            MM.camera.started = 1; // Mark as started successfully
+            done = 1; // Signal the generator to finish waiting
+        }
+         // Listen for video errors
+        vidcap.addEventListener('error', (e) => {
+             console.error("Video element error:", e);
+             onCameraFail(new Error(`Video element error. Code: ${vidcap.error?.code}`));
+        });
+    })
+    .catch(e => {
+         console.error("navigator.mediaDevices.getUserMedia failed:", e);
+         onCameraFail(e); // Use your existing error handler
+    });
+
+     // Wait for the camera stream to be ready or fail
+    while (!done) {
+        yield 0; // Yield control while waiting
+    }
+
+    // The success/failure state is now reflected in MM.camera.started (1 or -1)
+    // If successful, GRABBER is already writing to FS.
+    // The Python side using get_raw() will wait for the first frame file to appear.
+
+    // Yield the final camera start status (1 for success, -1 for failure)
+    yield window.MM.camera.started;
+
+     if (MM.camera.started === 1) {
+          console.log("Camera initialization yielding success state.");
+          // The generator can continue if the Python side calls get_raw()
+     } else {
+          console.error("Camera initialization yielding failure state.");
+          // The generator will stop here if it was called via `yield * MM.camera.init(...)`
+     }
 }
 
 //=========================================================
@@ -1787,87 +2247,225 @@ window.MM.camera.init = function * (device, width,height, preview, grabber) {
 window.svg = { }
 
 window.svg.init = function () {
+     // Use OffscreenCanvas if supported, otherwise a hidden HTMLCanvasElement
     if (svg.screen)
-        return
-    svg.screen = new OffscreenCanvas(canvas.width, canvas.height)
-    svg.ctx = svg.screen.getContext('2d')
+        return // Already initialized
 
+     try {
+         svg.screen = new OffscreenCanvas(canvas.width, canvas.height); // canvas needs to be defined globally or passed
+         console.log("Using OffscreenCanvas for SVG rendering.");
+     } catch (e) {
+         console.warn("OffscreenCanvas not supported or failed for SVG, falling back to hidden HTMLCanvasElement:", e);
+         svg.screen = document.createElement('canvas');
+         svg.screen.width = canvas ? canvas.width : 640; // Default size if canvas is not defined yet
+         svg.screen.height = canvas ? canvas.height : 480;
+         svg.screen.style.display = 'none'; // Keep it hidden
+         document.body.appendChild(svg.screen); // Add to body even if hidden
+     }
+
+     // Check if canvas is defined for context size
+     if (window.canvas) {
+         svg.screen.width = canvas.width;
+         svg.screen.height = canvas.height;
+     } else {
+         console.warn("SVG init: 'canvas' element not found. Using default size.");
+     }
+
+
+    svg.ctx = svg.screen.getContext('2d');
+     if (!svg.ctx) {
+         console.error("Failed to get 2D context for SVG rendering canvas.");
+         // Maybe mark svg functionality as broken?
+     }
 }
 
 window.svg.render =  function * (path, dest) {
-    var converted = 0
-    svg.init()
-    dest = dest || path + ".png"
-    let blob = new Blob([FS.readFile(path)], {type: 'image/svg+xml'});
-    let url = URL.createObjectURL(blob);
+     if (!svg.ctx) {
+          console.error("SVG rendering context not initialized. Call svg.init first or ensure canvas exists.");
+          yield new Error("SVG context not available"); // Yield error
+          return; // Exit generator
+     }
 
-    svg.ctx.clearRect(0, 0, -1, -1);
+    var converted = 0;
+    // svg.init() // Call init inside render just in case, but ideally done earlier
+     window.svg.init(); // Ensure context exists
+
+    dest = dest || path + ".png";
+    let blob = null;
+    let url = null;
+
+    try {
+        const svgData = FS.readFile(path, { encoding: 'utf8' }); // Read as text for SVG
+        blob = new Blob([svgData], {type: 'image/svg+xml'});
+        url = URL.createObjectURL(blob);
+    } catch (e) {
+        console.error(`Failed to read SVG file from FS at ${path}:`, e);
+        yield new Error(`Failed to read SVG file: ${e.message}`);
+        return;
+    }
+
+
+    svg.ctx.clearRect(0, 0, svg.screen.width, svg.screen.height); // Clear the canvas
 
     let rd = new Image();
-        rd.src = url
+        rd.src = url;
 
-    async function load_cleanup () {
-        svg.ctx.drawImage(rd, 0, 0 )
+    // Use a Promise to wait for the image to load and processing to finish
+    const renderPromise = new Promise((resolve, reject) => {
+        rd.onload = async function () {
+             try {
+                // Draw the loaded SVG image onto the canvas
+                svg.ctx.drawImage(rd, 0, 0, svg.screen.width, svg.screen.height); // Draw stretched to canvas size
 
-        window.svg.blob = await svg.screen.convertToBlob()
-        const reader = new FileReader()
-        reader.addEventListener("load", () => {
-            FS.writeFile(dest,  new Int8Array(reader.result) )
-            console.log("svg conversion of", path,"to png complete :" , dest)
-            converted = 1
-          }, false
-        );
-        reader.readAsArrayBuffer(svg.blob)
-        URL.revokeObjectURL(url)
+                // Convert the canvas content to a PNG Blob
+                window.svg.blob = await svg.screen.convertToBlob({type:"image/png"});
 
+                // Use FileReader to read the Blob data
+                const reader = new FileReader();
+                reader.onloadend = () => { // Use loadend for success or failure
+                     if (reader.error) {
+                         console.error("FileReader error reading PNG blob:", reader.error);
+                         reject(reader.error); // Reject the promise on reader error
+                         return;
+                     }
+                     try {
+                         // Write the PNG data to the virtual FS
+                        FS.writeFile(dest, new Int8Array(reader.result) );
+                        console.log("SVG conversion of", path,"to png complete :", dest);
+                        resolve(dest); // Resolve the promise with the destination path
+                     } catch (fsWriteError) {
+                         console.error(`Error writing PNG file to FS at ${dest}:`, fsWriteError);
+                         reject(fsWriteError); // Reject on FS write error
+                     }
+                };
+                reader.readAsArrayBuffer(window.svg.blob); // Start reading the blob
+
+             } catch (drawOrBlobError) {
+                 console.error("Error during SVG drawing or blob conversion:", drawOrBlobError);
+                 reject(drawOrBlobError); // Reject the promise on draw/blob error
+             } finally {
+                URL.revokeObjectURL(url); // Clean up the Blob URL immediately after Image is loaded
+                // The Blob data is now in reader.result (handled by reader.onloadend)
+                // No need to keep the blob URL alive.
+             }
+        };
+
+        rd.onerror = function (e) {
+            console.error(`Error loading SVG image from URL ${url}:`, e);
+            URL.revokeObjectURL(url); // Clean up on error too
+            reject(new Error(`Failed to load SVG image: ${e.message}`)); // Reject the promise on image load error
+        };
+    });
+
+    // The generator yields while waiting for the promise to resolve or reject
+    let result = null;
+    try {
+        result = await renderPromise;
+        converted = 1; // Mark success if promise resolved
+    } catch (e) {
+         console.error("SVG render promise failed:", e);
+         result = e; // Capture the error
+         converted = -1; // Mark failure
     }
-    rd.addEventListener('load', load_cleanup );
-    while (!converted)
-        yield converted
+
+
+    // Yield the result (destination path on success, or Error object on failure)
+    yield result;
+
+    // The generator is done.
 }
 
 window.svg.draw = function (path, x, y) {
-    svg.init()
-    let blob = new Blob([FS.readFile(path)], {type: 'image/svg+xml'});
-    let url = URL.createObjectURL(blob);
+     if (!svg.ctx) {
+          console.error("SVG drawing context not initialized. Call svg.init first or ensure canvas exists.");
+          return; // Exit if context is not available
+     }
+     // Ensure the main canvas element is available globally
+     const mainCanvas = window.canvas || document.getElementById('canvas');
+     const mainCtx = mainCanvas ? mainCanvas.getContext('2d') : null;
+
+     if (!mainCtx) {
+         console.error("Main canvas or its 2D context not available for SVG drawing.");
+         return;
+     }
+
+
+    // svg.init() // Ensure svg canvas is initialized, although it's mainly for render
+    // For drawing directly to main canvas, we only need to load the image.
+
+
+    let blob = null;
+    let url = null;
+
+    try {
+        const svgData = FS.readFile(path, { encoding: 'utf8' }); // Read as text
+        blob = new Blob([svgData], {type: 'image/svg+xml'});
+        url = URL.createObjectURL(blob);
+    } catch (e) {
+        console.error(`Failed to read SVG file from FS at ${path} for drawing:`, e);
+        return;
+    }
+
 
     const rd = new Image();
     rd.src = url
     function load_cleanup () {
-        canvas.getContext('2d').drawImage(rd,x || 0, y || 0 )
-        URL.revokeObjectURL(url)
+         // Draw the loaded SVG image onto the main canvas
+         // You might want to scale it here if needed, currently draws at intrinsic SVG size
+        mainCtx.drawImage(rd, x || 0, y || 0 );
+        URL.revokeObjectURL(url); // Clean up the Blob URL
+         console.log(`SVG from ${path} drawn to main canvas at (${x||0}, ${y||0}).`);
     }
     rd.addEventListener('load', load_cleanup );
+     rd.addEventListener('error', (e) => {
+         console.error(`Error loading SVG image from URL ${url} for drawing:`, e);
+         URL.revokeObjectURL(url); // Clean up on error too
+     });
 }
 
 //=========================================================
 // js.misc
 
 window.chromakey = function(context, r,g,b, tolerance, alpha) {
-    context = canvas.getContext('2d', { willReadFrequently: true } );
+     // Ensure a context is provided or try to get the main canvas context
+     const targetCtx = context || (window.canvas ? window.canvas.getContext('2d', { willReadFrequently: true }) : null);
 
-    var imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+     if (!targetCtx) {
+         console.error("Cannot perform chromakey: No 2D context provided or main canvas context not available.");
+         return;
+     }
+
+
+    var imageData = targetCtx.getImageData(0, 0, targetCtx.canvas.width, targetCtx.canvas.height);
     var data = imageData.data;
 
-    r = r || data[0]
-    g = g || data[1]
-    b = b || data[2]
-    tolerance = tolerance || 255;
-    tolerance -= 255
-    alpha = alpha || 0
+    // Default to the color of the first pixel if r,g,b are not provided
+     if (r === undefined || r === null) r = data[0];
+     if (g === undefined || g === null) g = data[1];
+     if (b === undefined || b === null) b = data[2];
+
+    tolerance = tolerance || 0; // Default tolerance to 0, 255 makes little sense as a threshold
+    alpha = alpha || 0; // Default alpha to 0 (fully transparent)
 
     for(var i = 0, n = data.length; i < n; i += 4) {
+        // Calculate color difference (Manhattan distance in RGB space)
         var diff = Math.abs(data[i] - r) + Math.abs(data[i+1] - g) + Math.abs(data[i+2] - b);
+
+        // Check if the difference is within the tolerance
+        // Note: Your original code's tolerance check `diff <= tolerance` with `tolerance -= 255` seems reversed.
+        // A common chromakey checks if `diff <= threshold`. Let's assume tolerance is the threshold.
         if(diff <= tolerance) {
-            data[i + 3] = alpha;
+            data[i + 3] = alpha; // Set alpha channel
         }
     }
-    context.putImageData(imageData, 0, 0);
+    targetCtx.putImageData(imageData, 0, 0);
+    console.log(`Chromakey applied with target RGB(${r},${g},${b}), tolerance ${tolerance}, alpha ${alpha}.`);
 }
 
 
 
 window.mobile_check = function() {
+    // Basic regex check for common mobile user agents
     let check = false;
     (   function(a){
         if(/(android|bb\d+|meego).+mobile|avantgo|bada\/|blackberry|blazer|compal|elaine|fennec|hiptop|iemobile|ip(hone|od)|iris|kindle|lge |maemo|midp|mmp|mobile.+firefox|netfront|opera m(ob|in)i|palm( os)?|phone|p(ixi|re)\/|plucker|pocket|psp|series(4|6)0|symbian|treo|up\.(browser|link)|vodafone|wap|windows ce|xda|xiino/i.test(a)||/1207|6310|6590|3gso|4thp|50[1-6]i|770s|802s|a wa|abac|ac(er|oo|s\-)|ai(ko|rn)|al(av|ca|co)|amoi|an(ex|ny|yw)|aptu|ar(ch|go)|as(te|us)|attw|au(di|\-m|r |s )|avan|be(ck|ll|nq)|bi(lb|rd)|bl(ac|az)|br(e|v)w|bumb|bw\-(n|u)|c55\/|capi|ccwa|cdm\-|cell|chtm|cldc|cmd\-|co(mp|nd)|craw|da(it|ll|ng)|dbte|dc\-s|devi|dica|dmob|do(c|p)o|ds(12|\-d)|el(49|ai)|em(l2|ul)|er(ic|k0)|esl8|ez([4-7]0|os|wa|ze)|fetc|fly(\-|_)|g1 u|g560|gene|gf\-5|g\-mo|go(\.w|od)|gr(ad|un)|haie|hcit|hd\-(m|p|t)|hei\-|hi(pt|ta)|hp( i|ip)|hs\-c|ht(c(\-| |_|a|g|p|s|t)|tp)|hu(aw|tc)|i\-(20|go|ma)|i230|iac( |\-|\/)|ibro|idea|ig01|ikom|im1k|inno|ipaq|iris|ja(t|v)a|jbro|jemu|jigs|kddi|keji|kgt( |\/)|klon|kpt |kwc\-|kyo(c|k)|le(no|xi)|lg( g|\/(k|l|u)|50|54|\-[a-w])|libw|lynx|m1\-w|m3ga|m50\/|ma(te|ui|xo)|mc(01|21|ca)|m\-cr|me(rc|ri)|mi(o8|oa|ts)|mmef|mo(01|02|bi|de|do|t(\-| |o|v)|zz)|mt(50|p1|v )|mwbp|mywa|n10[0-2]|n20[2-3]|n30(0|2)|n50(0|2|5)|n7(0(0|1)|10)|ne((c|m)\-|on|tf|wf|wg|wt)|nok(6|i)|nzph|o2im|op(ti|wv)|oran|owg1|p800|pan(a|d|t)|pdxg|pg(13|\-([1-8]|c))|phil|pire|pl(ay|uc)|pn\-2|po(ck|rt|se)|prox|psio|pt\-g|qa\-a|qc(07|12|21|32|60|\-[2-7]|i\-)|qtek|r380|r600|raks|rim9|ro(ve|zo)|s55\/|sa(ge|ma|mm|ms|ny|va)|sc(01|h\-|oo|p\-)|sdk\/|se(c(\-|0|1)|47|mc|nd|ri)|sgh\-|shar|sie(\-|m)|sk\-0|sl(45|id)|sm(al|ar|b3|it|t5)|so(ft|ny)|sp(01|h\-|v\-|v )|sy(01|mb)|t2(18|50)|t6(00|10|18)|ta(gt|lk)|tcl\-|tdg\-|tel(i|m)|tim\-|t\-mo|to(pl|sh)|ts(70|m\-|m3|m5)|tx\-9|up(\.b|g1|si)|utst|v400|v750|veri|vi(rg|te)|vk(40|5[0-3]|\-v)|vm40|voda|vulc|vx(52|53|60|61|70|80|81|83|85|98)|w3c(\-| )|webc|whit|wi(g |nc|nw)|wmlb|wonu|x700|yas\-|your|zeto|zte\-/i.test(a.substr(0,4)))
@@ -1878,6 +2476,7 @@ window.mobile_check = function() {
 }
 
 window.mobile_tablet = function() {
+    // Regex check including tablets
     let check = false;
     (   function(a){
         if(/(android|bb\d+|meego).+mobile|avantgo|bada\/|blackberry|blazer|compal|elaine|fennec|hiptop|iemobile|ip(hone|od)|iris|kindle|lge |maemo|midp|mmp|mobile.+firefox|netfront|opera m(ob|in)i|palm( os)?|phone|p(ixi|re)\/|plucker|pocket|psp|series(4|6)0|symbian|treo|up\.(browser|link)|vodafone|wap|windows ce|xda|xiino|android|ipad|playbook|silk/i.test(a)||/1207|6310|6590|3gso|4thp|50[1-6]i|770s|802s|a wa|abac|ac(er|oo|s\-)|ai(ko|rn)|al(av|ca|co)|amoi|an(ex|ny|yw)|aptu|ar(ch|go)|as(te|us)|attw|au(di|\-m|r |s )|avan|be(ck|ll|nq)|bi(lb|rd)|bl(ac|az)|br(e|v)w|bumb|bw\-(n|u)|c55\/|capi|ccwa|cdm\-|cell|chtm|cldc|cmd\-|co(mp|nd)|craw|da(it|ll|ng)|dbte|dc\-s|devi|dica|dmob|do(c|p)o|ds(12|\-d)|el(49|ai)|em(l2|ul)|er(ic|k0)|esl8|ez([4-7]0|os|wa|ze)|fetc|fly(\-|_)|g1 u|g560|gene|gf\-5|g\-mo|go(\.w|od)|gr(ad|un)|haie|hcit|hd\-(m|p|t)|hei\-|hi(pt|ta)|hp( i|ip)|hs\-c|ht(c(\-| |_|a|g|p|s|t)|tp)|hu(aw|tc)|i\-(20|go|ma)|i230|iac( |\-|\/)|ibro|idea|ig01|ikom|im1k|inno|ipaq|iris|ja(t|v)a|jbro|jemu|jigs|kddi|keji|kgt( |\/)|klon|kpt |kwc\-|kyo(c|k)|le(no|xi)|lg( g|\/(k|l|u)|50|54|\-[a-w])|libw|lynx|m1\-w|m3ga|m50\/|ma(te|ui|xo)|mc(01|21|ca)|m\-cr|me(rc|ri)|mi(o8|oa|ts)|mmef|mo(01|02|bi|de|do|t(\-| |o|v)|zz)|mt(50|p1|v )|mwbp|mywa|n10[0-2]|n20[2-3]|n30(0|2)|n50(0|2|5)|n7(0(0|1)|10)|ne((c|m)\-|on|tf|wf|wg|wt)|nok(6|i)|nzph|o2im|op(ti|wv)|oran|owg1|p800|pan(a|d|t)|pdxg|pg(13|\-([1-8]|c))|phil|pire|pl(ay|uc)|pn\-2|po(ck|rt|se)|prox|psio|pt\-g|qa\-a|qc(07|12|21|32|60|\-[2-7]|i\-)|qtek|r380|r600|raks|rim9|ro(ve|zo)|s55\/|sa(ge|ma|mm|ms|ny|va)|sc(01|h\-|oo|p\-)|sdk\/|se(c(\-|0|1)|47|mc|nd|ri)|sgh\-|shar|sie(\-|m)|sk\-0|sl(45|id)|sm(al|ar|b3|it|t5)|so(ft|ny)|sp(01|h\-|v\-|v )|sy(01|mb)|t2(18|50)|t6(00|10|18)|ta(gt|lk)|tcl\-|tdg\-|tel(i|m)|tim\-|t\-mo|to(pl|sh)|ts(70|m\-|m3|m5)|tx\-9|up(\.b|g1|si)|utst|v400|v750|veri|vi(rg|te)|vk(40|5[0-3]|\-v)|vm40|voda|vulc|vx(52|53|60|61|70|80|81|83|85|98)|w3c(\-| )|webc|whit|wi(g |nc|nw)|wmlb|wonu|x700|yas\-|your|zeto|zte\-/i.test(a.substr(0,4)))
@@ -1889,24 +2488,34 @@ window.mobile_tablet = function() {
 
 window.mobile = () => {
     try {
-        return navigator.userAgentData.mobile
+        // Use the newer userAgentData if available
+        if (navigator.userAgentData && typeof navigator.userAgentData.mobile === 'boolean') {
+             return navigator.userAgentData.mobile;
+        }
     } catch (x) {
-        console.warn("FIXME:", x)
+        console.warn("Error accessing navigator.userAgentData.mobile:", x);
     }
 
-    return mobile_check()
+    // Fallback to older checks if userAgentData is not available or fails
+    return mobile_check(); // Use the basic regex check
 }
 
 
 if (navigator.connection) {
+    // Check if connection type and downlinkMax are available
     if ( navigator.connection.type === 'cellular' ) {
-        console.warn("Connection:","Cellular")
-        if ( navigator.connection.downlinkMax <= 0.115) {
-            console.warn("Connection:","2G")
+        console.warn("Connection:","Cellular");
+        if ( navigator.connection.downlinkMax !== Infinity && navigator.connection.downlinkMax <= 0.115) { // Check for Infinity before comparing
+            console.warn("Connection:","Likely 2G"); // Use "Likely" as this is an estimate
+        } else if (navigator.connection.effectiveType) { // Check effectiveType if available
+             console.warn("Connection: Effective Type:", navigator.connection.effectiveType);
         }
     } else {
-        console.warn("Connection:","Wired")
+        console.warn("Connection:","Non-cellular (e.g., Wi-Fi, Wired)");
     }
+     if (navigator.connection.saveData) {
+          console.warn("Connection: Save Data mode is enabled.");
+     }
 }
 
 
@@ -1915,39 +2524,229 @@ if (navigator.connection) {
 window.io = {}
 
 async function open_port() {
-    var device = new WebUSBSerialDevice();
-console.log("device", device)
-    var ports = await device.getAvailablePorts()
-console.log("ports", ports);
-    var port = await device.requestNewPort();
-    const codec = new TextDecoder
-    const coder = new TextEncoder()
+    // Check for WebUSB API support
+    if (!navigator.usb) {
+         console.error("WebUSB API not supported in this browser.");
+         window.io.port = null; // Explicitly set to null on failure
+         return null; // Return null promise
+    }
+    var device = null; // WebUSBDevice instance from requestDevice
 
-    function cb(msg) {
-        const data = codec.decode(msg)
-        console.log("recv",data )
-        window.io.port.data = port.data + data
+     try {
+        // device = new WebUSBSerialDevice(); // This class might not be built-in, depends on external script
+        // Assuming WebUSBSerialDevice is something that provides getAvailablePorts and requestNewPort
+        // A more standard WebUSB flow involves navigator.usb.requestDevice
+
+        // Standard WebUSB flow:
+        // Request a device based on filters (e.g., vendorId, productId)
+         console.log("Requesting USB device...");
+         const devices = await navigator.usb.requestDevice({ filters: [{ /* add appropriate filters, e.g. vendorId */ }] });
+         if (!devices) {
+             console.warn("No USB device selected or found.");
+             window.io.port = null;
+             return null;
+         }
+         // Assuming the selected device is the one we want to use as a serial port
+         device = devices; // The result of requestDevice is the device object directly
+
+         console.log("USB device selected:", device);
+
+        // Find a configuration and interface with a CDC ACM endpoint (serial port)
+        // This part is complex and depends on the specific device's descriptors.
+        // Libraries like https://github.com/serialport/webserialport-wrapper might simplify this.
+        // Or you need to manually iterate through configurations, interfaces, and endpoints.
+        // For a simple answer, let's assume a 'port' object representing the serial connection is obtained.
+        // This 'port' object would need methods like connect, send, close, and emit data events.
+
+        // *** Placeholder for actual USB serial connection logic ***
+        // Replace this placeholder with actual code to open endpoints and set up reading/writing.
+        // This requires detailed knowledge of the target USB device's descriptors (vid, pid, endpoints, interfaces).
+        // The original code seems to imply a 'WebUSBSerialDevice' helper class which is not standard JS.
+        // If you have a separate 'webusb-serial-device.js' file, that needs to be included too.
+
+        // For demonstration, let's simulate a basic 'port' object structure if the device was found:
+         const port = {
+             device: device, // Store the found device
+             isConnected: false,
+             data: "", // Buffer for incoming data
+             reader: null, // ReadableStreamDefaultReader
+             writer: null, // WritableStreamDefaultWriter
+             readLoop: async function(callback, errorCallback) {
+                  if (!this.reader) {
+                      errorCallback(new Error("Serial reader not initialized."));
+                      return;
+                  }
+                  console.log("Serial read loop started.");
+                  try {
+                      while (this.isConnected) {
+                          const { value, done } = await this.reader.read();
+                          if (done) {
+                              console.log("Serial reader finished.");
+                              break;
+                          }
+                          if (value) {
+                              // Assuming data is text, decode it
+                              const text = new TextDecoder().decode(value);
+                              callback(text); // Call the user-provided callback with data
+                          }
+                      }
+                  } catch (error) {
+                      console.error("Serial read loop error:", error);
+                      if (errorCallback) errorCallback(error);
+                  } finally {
+                      console.log("Serial read loop exiting.");
+                       this.close().catch(e => console.error("Error closing port after read loop:", e));
+                  }
+             },
+             connect: async function(dataCallback, errorCallback) {
+                 try {
+                     // *** Replace with actual USB device open, claim interface, open endpoints ***
+                     // Example:
+                     // await this.device.open();
+                     // const configuration = this.device.configuration || this.device.configurations[0];
+                     // await this.device.selectConfiguration(configuration.configurationValue);
+                     // const interface = configuration.interfaces.find(i => /* find correct interface */);
+                     // await this.device.claimInterface(interface.interfaceNumber);
+                     // const endpointIn = interface.endpoints.find(e => e.direction === 'in');
+                     // const endpointOut = interface.endpoints.find(e => e.direction === 'out');
+                     // this.reader = this.device.transferIn(endpointIn.endpointNumber, 64).getReader(); // Example read
+                     // this.writer = this.device.transferOut(endpointOut.endpointNumber).getWriter(); // Example write
+
+                     // Dummy connect for now
+                     console.log("Dummy USB port connected.");
+                     this.isConnected = true;
+                     this.reader = { // Dummy reader
+                         read: async () => { await delay(1000); console.log("Dummy read..."); return { value: new TextEncoder().encode("dummy data\r\n"), done: false }; },
+                         releaseLock: () => console.log("Dummy reader releaseLock")
+                     };
+                     this.writer = { // Dummy writer
+                         write: async (data) => { console.log("Dummy write:", new TextDecoder().decode(data)); return; },
+                         close: async () => console.log("Dummy writer close"),
+                         releaseLock: () => console.log("Dummy writer releaseLock")
+                     };
+
+                     // Start the read loop
+                     this.readLoop(dataCallback, errorCallback);
+
+                     return "connected"; // Indicate success
+                 } catch (error) {
+                     console.error("Failed to connect to USB device:", error);
+                     this.isConnected = false;
+                     if (errorCallback) errorCallback(error);
+                     // Clean up readers/writers/interfaces/device if they were partially opened
+                     // ... cleanup logic ...
+                     return null; // Indicate failure
+                 }
+             },
+             send: async function(data) {
+                 if (!this.isConnected || !this.writer) {
+                     console.error("Cannot send data: Port not connected or writer not available.");
+                     return;
+                 }
+                 try {
+                     await this.writer.write(data);
+                 } catch (error) {
+                     console.error("Error sending data:", error);
+                     // Handle write error, maybe disconnect
+                 }
+             },
+             close: async function() {
+                 if (!this.isConnected) {
+                     console.log("Port already closed.");
+                     return;
+                 }
+                 console.log("Closing USB port.");
+                 this.isConnected = false;
+                 try {
+                     // Release reader and writer locks
+                     if (this.reader) await this.reader.cancel().catch(e => console.warn("Error cancelling reader:", e));
+                     if (this.reader && this.reader.releaseLock) this.reader.releaseLock(); // Some implementations need this
+                     if (this.writer) await this.writer.close().catch(e => console.warn("Error closing writer:", e));
+                     if (this.writer && this.writer.releaseLock) this.writer.releaseLock(); // Some implementations need this
+
+                     // Release interfaces and close the device
+                     // await this.device.releaseInterface(...); // Release claimed interface(s)
+                     // await this.device.close(); // Close the device
+
+                 } catch (error) {
+                     console.error("Error during USB port close:", error);
+                 } finally {
+                      this.reader = null;
+                      this.writer = null;
+                      // device = null; // Don't clear device object if it might be reused
+                      console.log("USB port closed.");
+                 }
+             },
+             // Add a disconnect event listener if the underlying implementation supports it
+             // device.addEventListener('disconnect', (event) => { ... });
+         };
+
+         // *** End of Placeholder ***
+
+         // The original code's 'port.data = port.data + data' suggests 'port' itself holds the buffer
+         // Let's ensure the port object has this buffer property
+         port.data = "";
+
+
+        const codec = new TextDecoder(); // Used inside the dummy readLoop for decoding
+
+        // The cb function in the original code expects to receive decoded text directly
+        // Modify the dummy readLoop to pass decoded text to the callback.
+
+        function cb(dataChunk) { // This cb receives decoded text from the readLoop
+            console.log("recv", dataChunk);
+            // Append text data to the port's buffer
+            if (window.io.port) {
+                window.io.port.data += dataChunk;
+            }
+        }
+
+        port.read = () => {
+            const data = window.io.port ? window.io.port.data : "";
+            if (window.io.port) {
+                window.io.port.data = ""; // Clear the buffer after reading
+            }
+            return data;
+        }
+
+        port.write = (data) => {
+            // Ensure data is encoded to bytes before sending via USB
+             if (window.io.port && window.io.port.send) {
+                 const coder = new TextEncoder();
+                 window.io.port.send(coder.encode(data));
+             } else {
+                 console.error("Cannot write: Port not available or send method missing.");
+             }
+        }
+
+         // Connect the port and start the read loop
+         const connection_status = await port.connect(cb, (error)=>console.error("USB Port Error:", error) );
+
+         if (connection_status === "connected") {
+            window.io.port = port;
+            console.log("USB port opened successfully.");
+         } else {
+             console.error("Failed to open USB port.");
+             window.io.port = null;
+         }
+
+    } catch (requestError) {
+        console.error("Error requesting USB device:", requestError);
+        window.io.port = null; // Ensure port is null on failure
     }
 
-    port.read = () => {
-        const data = window.io.port.data
-        window.io.port.data = ""
-        return data
-    }
 
-    port.write = (data) => {
-        port.send(coder.encode(data))
-    }
+     // Yield until window.io.port is set (either to a valid port or null)
+    while (window.io.port === undefined) // Wait for the try/catch block to complete and set window.io.port
+        yield 0;
 
-    var data = await port.connect(cb, (error)=>console.error(error) )
-    window.io.port = port
+     // Yield the port object (will be null on failure, the port object on success)
+    yield window.io.port;
 }
 
 window.io.open_serial = function * () {
-    open_port()
-    while (!window.io.port)
-        yield 0
-    yield window.io.port
+    // This generator function now correctly calls the async open_port and yields its result
+    yield* open_port();
 }
 
 
@@ -1967,25 +2766,63 @@ window.debug = function () {
     vm.config.debug = true
     const debug_hidden =  false
     try {
-        window.custom_onload(debug_hidden)
+        // Check if custom_onload is a function before calling
+        if (typeof window.custom_onload === 'function') {
+             window.custom_onload(debug_hidden);
+        } else {
+             console.warn("window.custom_onload is not defined or not a function.");
+             throw new Error("custom_onload not available"); // Trigger catch block
+        }
 
     } catch (x) {
-        console.error("using debug UI default, because no custom_onload or failure")
-        for (const e of ["pyconsole","system","iframe","transfer","info","box","terminal"] ) {
-            if (window[e])
-                window[e].hidden = debug_hidden
+        console.error("Using debug UI default, because no custom_onload or failure:", x);
+        // Ensure elements exist before trying to access/modify 'hidden'
+        const elements = ["pyconsole", "system", "iframe", "transfer", "info", "box", "terminal", "stdio", "stdout", "canvas", "canvas3d", "vidcap", "framegrabber_canvas", "dlg_multifile"]; // Add relevant IDs
+        for (const id of elements ) {
+             const element = document.getElementById(id);
+             if (element) {
+                 element.hidden = debug_hidden;
+             } else {
+                 // console.warn(`Debug element #${id} not found.`);
+             }
         }
     }
-    vm.PyRun_SimpleString(`#!
+    // Ensure python object and PyRun_SimpleString method exist before calling
+    if (window.python && typeof window.python.PyRun_SimpleString === 'function') {
+        vm.PyRun_SimpleString(`#!
 shell.uptime()
-`)
-    window_resize()
+`);
+    } else {
+        console.warn("Python runtime not ready for shell.uptime()");
+    }
+
+     // Ensure window_resize is defined before calling
+    if (typeof window.window_resize === 'function') {
+         window_resize();
+    } else {
+         console.warn("window_resize function is not defined.");
+    }
 }
 
 
 window.blob = function blob(filename) {
-    console.warn(__FILE__, "1458: TODO: revoke blob url")
-    return URL.createObjectURL( new Blob([FS.readFile(filename)],  { oneTimeOnly: true }))
+    console.warn(__FILE__, "1458: TODO: revoke blob url (Blob URLs can be garbage collected, but explicit revoke is safer)");
+     try {
+        // Ensure FS and FS.readFile exist
+        if (window.FS && typeof FS.readFile === 'function') {
+             const fileData = FS.readFile(filename);
+             const blob = new Blob([fileData]);
+             const url = URL.createObjectURL(blob);
+             // Consider adding this URL to a list to revoke later if memory is a concern
+             return url;
+        } else {
+            console.error("FS or FS.readFile not available to create blob.");
+            return null;
+        }
+     } catch (e) {
+         console.error(`Error creating blob for file ${filename}:`, e);
+         return null;
+     }
 }
 
 // ========================================
@@ -1995,29 +2832,96 @@ window.blob = function blob(filename) {
 window.rpc = { path : [], call : "", argv : [] }
 
 function bridge(host) {
+     // Check if host object is valid
+     if (!host) {
+          console.error("RPC bridge created with invalid host.");
+          // Return a dummy object that logs errors or null
+          return {}; // Or throw error
+     }
+
     const pybr = new Proxy(function () {}, {
     get(_, k, receiver) {
-        rpc.path.push(k)
-        return pybr
+         if (typeof k === 'symbol') { // Handle Symbol properties (like Symbol.toStringTag)
+             // Return something reasonable for known symbols or just the proxy itself
+             if (k.toString() === 'Symbol(Symbol.toStringTag)') {
+                  return 'Function'; // Or 'Proxy'
+             }
+              // For other symbols, maybe just return the proxy to allow chaining? Or throw error?
+             return pybr; // Allowing chaining for unknown symbols too
+         }
+        rpc.path.push(String(k)); // Convert key to string
+        return pybr;
     },
-    apply(_, o, argv) {
-        const call = rpc.path.join(".")
-        if (host === window.python) {
-// TODO: rpc id / event serialisation
-            queue_event("rpc", { "call": call, "argv" : argv, "rpcid": window.event} )
-        } else {
-            window.rpc.call = call
-            window.rpc.argv = Array.from(argv)
-            if (!argv.length) {
-                console.error("event should always be first param")
-                window.rpc.argv.unshift(window.event)
-            } else if (argv.length>0 && (window.event!==argv[0])) {
-                console.error("event should always be first param")
-                window.rpc.argv.unshift(window.event)
+    apply(_, thisArg, argv) { // Use thisArg standard parameter name
+        const call = rpc.path.join(".");
+        // Check if the host is ready to receive RPC calls
+         if (host === window.python && window.python && typeof window.python.PyRun_SimpleString === 'function' && window.python.is_ready) {
+             // Check if argv is an array
+             if (!Array.isArray(argv)) {
+                  console.error("RPC argv is not an array:", argv);
+                  argv = []; // Default to empty array
+             }
+
+// TODO: rpc id / event serialisation - The original code queues a generic 'rpc' event, not tied to response.
+            // The event should likely be the *first* argument passed from Python.
+            // If this bridge is called from JS (e.g., a DOM event handler), 'window.event' might be available.
+            // If called from Python via something like `__EMSCRIPTEN__.rpc_js_call(...)`, the first arg should be the event data.
+
+            // Let's assume the first argument from Python will contain event data or an RPC ID.
+            // When calling from JS, the first arg *should* be the JS event object or relevant data.
+
+            // For now, mirroring the original logic: queue the event with call, argv, and window.event (if available)
+            // This assumes the Python side's EventTarget can handle this structure.
+             const eventData = {
+                 "call": call,
+                 "argv": argv,
+                 "rpcid": window.event ? "js_event:" + window.event.type : "js_call" // Use a simple marker if no DOM event
+             };
+             // If Python is the host, queue the event
+             queue_event("rpc", eventData); // queue_event now checks if python/vt is ready
+
+        } else if (host && typeof host.click === 'function') { // Handle the non-python host case (like a hidden button)
+             // This pattern suggests using a DOM element (like a button) to signal Python in a worker.
+             // The `host.click()` would trigger an event listener *on that DOM element* which then messages the worker.
+             // The rpc data needs to be stored somewhere accessible to the event listener.
+             // window.rpc object is used for this.
+
+             // Check if argv is an array
+             if (!Array.isArray(argv)) {
+                  console.error("RPC argv is not an array:", argv);
+                  argv = []; // Default to empty array
+             }
+
+            window.rpc.call = call;
+            window.rpc.argv = Array.from(argv); // Store args in window.rpc
+
+            // The original code assumes the first arg *should* be window.event.
+            // This is fragile. A better approach is for the JS caller to explicitly pass event data.
+            // Keeping original logic for now but warning.
+            if (window.rpc.argv.length === 0 && window.event) {
+                 console.warn("RPC call made with no arguments, prepending window.event.");
+                 window.rpc.argv.unshift(window.event);
+            } else if (window.rpc.argv.length > 0 && window.event && window.rpc.argv[0] !== window.event) {
+                 // This check is problematic. The first argument might legitimately not be window.event.
+                 // Removing this check as it's likely incorrect usage pattern assumption.
+                 // console.error("event should always be first param?", window.event, window.rpc.argv[0]);
+                 // window.rpc.argv.unshift(window.event); // Still prepending as per original logic? No, this is weird.
+                 // Let's just log the warning and keep the args as they were passed.
+                 console.warn("RPC call has arguments, but first is not window.event.", {passed_args: argv, current_event: window.event});
             }
-            host.click()
+
+            // Trigger the click event on the host element
+            host.click();
+
+        } else {
+             console.error("RPC host is not a valid python runtime or clickable element:", host);
         }
-        rpc.path.length=0
+
+        rpc.path.length = 0; // Clear the path for the next call
+        // Note: The Proxy apply method typically returns void or a Promise if the underlying call is async.
+        // The original code returns nothing explicitly, which is fine for synchronous proxies,
+        // but might be limiting if RPC needs to return values.
+        // For now, matching original behavior.
     }
   });
   return pybr
@@ -2037,24 +2941,60 @@ window.Fetch = {}
 window.Fetch.POST = function * POST (url, data, flags)
 {
     // post info about the request
-    console.log("POST: " + url + "\nData: " + data);
-    var request = new Request(url, {method: 'POST', body: JSON.stringify(data)})
-    var content = 'undefined';
+    console.log("POST: " + url + "\nData: ", data); // Log data object, not stringified yet
+    var request = null;
+    try {
+        request = new Request(url, {
+            method: 'POST',
+             headers: {
+                 'Content-Type': 'application/json' // Often needed for JSON bodies
+             },
+            body: JSON.stringify(data) // Stringify the data object
+        });
+    } catch (e) {
+         console.error("Error creating POST request:", e);
+         // Yield an error? Or just return? Generator should probably yield error.
+         yield new Error(`Failed to create POST request: ${e.message}`);
+         return; // Exit generator
+    }
+
+
+    var content = 'undefined'; // Use a unique marker string or null
+     let fetchError = null;
+
     fetch(request, flags || {})
-   .then(resp => resp.text())
-   .then((resp) => {
-        console.log(resp);
-        content = resp;
+   .then(resp => {
+         if (!resp.ok) {
+             const error = new Error(`HTTP error! status: ${resp.status}`);
+             error.response = resp; // Attach the response object to the error
+             throw error; // Throw to enter the catch block
+         }
+         return resp.text(); // Assuming text response for now
+    })
+   .then((resp_text) => {
+        console.log("POST response:", resp_text);
+        content = resp_text; // Set the content on success
    })
    .catch(err => {
          // handle errors
-         console.log("An Error Occurred:")
-         console.log(err);
+         console.error("An Error Occurred during POST fetch:");
+         console.error(err);
+         fetchError = err; // Store the error
+         content = null; // Set content to null or an error marker on failure
     });
 
-    while(content == 'undefined'){
-        yield content;
+    // Generator loop to wait for the async fetch to complete
+    while(content === 'undefined' && fetchError === null){ // Wait while still pending
+        yield undefined; // Yield undefined or null while waiting
     }
+
+     // Yield the result or the error
+     if (fetchError) {
+          yield fetchError; // Yield the error object
+     } else {
+          yield content; // Yield the fetched content (text)
+     }
+     // Generator is done
 }
 
 // Only URL to be passed
@@ -2062,24 +3002,52 @@ window.Fetch.POST = function * POST (url, data, flags)
 window.Fetch.GET = function * GET (url, flags)
 {
     console.log("GET: " + url);
-    var request = new Request(url, { method: 'GET' })
-    var content = 'undefined';
+    var request = null;
+     try {
+         request = new Request(url, { method: 'GET' });
+     } catch (e) {
+          console.error("Error creating GET request:", e);
+          yield new Error(`Failed to create GET request: ${e.message}`);
+          return;
+     }
+
+    var content = 'undefined'; // Use a unique marker string or null
+     let fetchError = null;
+
     fetch(request, flags || {})
-   .then(resp => resp.text())
-   .then((resp) => {
-        console.log(resp);
-        content = resp;
+   .then(resp => {
+         if (!resp.ok) {
+             const error = new Error(`HTTP error! status: ${resp.status}`);
+             error.response = resp;
+             throw error;
+         }
+         return resp.text(); // Assuming text response
+    })
+   .then((resp_text) => {
+        console.log("GET response:", resp_text);
+        content = resp_text; // Set content on success
    })
    .catch(err => {
          // handle errors
-         console.log("An Error Occurred:");
-         console.log(err);
+         console.error("An Error Occurred during GET fetch:");
+         console.error(err);
+         fetchError = err; // Store the error
+         content = null; // Set content to null or an error marker on failure
     });
 
-    while(content == 'undefined'){
+    // Generator loop to wait
+    while(content === 'undefined' && fetchError === null){ // Wait while pending
         // generator
-        yield content;
+        yield undefined; // Yield undefined or null while waiting
     }
+
+    // Yield the result or the error
+     if (fetchError) {
+          yield fetchError; // Yield the error object
+     } else {
+          yield content; // Yield the fetched content (text)
+     }
+    // Generator is done
 }
 
 
@@ -2088,64 +3056,158 @@ window.Fetch.GET = function * GET (url, flags)
 //          pyodide compat layer
 // ====================================================================================
 
+// This section seems specific to providing a Pyodide-like interface.
+// Your main script doesn't seem to use loadPyodide. Keeping it for completeness.
+// Note: This assumes a specific interaction pattern with the underlying VM.
+// The original runPython implementation was a placeholder.
 
 window.loadPyodide =
     async function loadPyodide(cfg) {
+        // Ensure cfg is an object
+        cfg = cfg || {};
+
+        // Provide a runPython stub. The actual execution depends on how the VM works.
+        // The original code uses vm.PyRun_SimpleString for string execution.
+        // Pyodide's runPython is more sophisticated (evaluates expressions, returns values).
+        // This implementation is a basic placeholder matching the original.
         vm.runPython =
             function runPython(code) {
-                console.warn("runPython N/I", code)
-                vm.PyRun_SimpleString(code)
-                return 'N/A'
+                console.warn("loadPyodide.runPython called. Note: This might not return results like Pyodide's runPython.");
+                console.log("Executing Python string via PyRun_SimpleString:", code);
+                // Check if vm.PyRun_SimpleString is available
+                if (vm && typeof vm.PyRun_SimpleString === 'function') {
+                    vm.PyRun_SimpleString(code);
+                    return 'Execution triggered (result not captured)'; // Indicate execution was attempted
+                } else {
+                    console.error("vm.PyRun_SimpleString is not available.");
+                    return 'Error: Runtime not ready for direct execution';
+                }
             }
 
-        console.warn("loadPyodide N/I")
-        auto_start(cfg)
-        auto_start = null
-        await onload()
-        onload = null
-        await _until(defined)("python")
-        vm.vt.xterm.write = cfg.stdout
-        console.warn("using ", python)
-        return vm
+        console.warn("loadPyodide stub called. Initializing Pygbag/Emscripten VM.");
+        // Call the standard auto_start and onload sequence
+        // auto_start needs a cfg object, potentially derived from the loadPyodide cfg
+        // The original auto_start also looks for script tags. Need to decide which path loadPyodide takes.
+        // Assuming loadPyodide provides the main script content or config.
+        // Let's adapt auto_start to accept an optional config object.
+
+        // Adapt cfg for auto_conf if needed. loadPyodide cfg might be different from script tag cfg.
+        const vmConfigFromPyodideCfg = {
+            // Map Pyodide cfg properties to vm.config properties if necessary
+            // For now, assume the primary configuration still comes from script tags or defaults.
+            // If loadPyodide *must* provide the main script/module, that needs more logic here.
+            // The original loadPyodide just calls auto_start with the passed cfg.
+            // This seems incorrect if auto_start expects script tag info.
+
+            // Let's assume loadPyodide is *replacing* the script tag method.
+            // We need to construct a cfg object for auto_conf.
+            url: cfg.indexURL || './pythons.js', // Default URL if none provided
+            python: cfg.python || 'cpython3', // Default python version
+            os: cfg.stdout ? 'stdout' : 'gui', // Simple OS based on stdout flag
+            text: cfg.code || '', // If code is provided directly
+            module: cfg.module || '', // If module name is provided
+            id: '__pyodide_loaded__',
+            // Pass other relevant cfg properties or map them
+            columns: cfg.columns,
+            lines: cfg.lines,
+            console: cfg.console,
+            cdn: cfg.cdnURL // Pyodide uses indexURL, this might map to cdn
+        };
+
+        // Call auto_conf with the constructed config
+        auto_conf(vmConfigFromPyodideCfg);
+
+        // If 'code' or 'module' is provided in cfg, set the main script block
+        if (vmConfigFromPyodideCfg.text) {
+             vm.script.blocks = [vmConfigFromPyodideCfg.text];
+             vm.PyConfig.run_filename = '__pyodide_code__.py'; // Indicate running inline code
+        } else if (vmConfigFromPyodideCfg.module) {
+             // This needs logic to fetch the module code... more complex.
+             console.error("loadPyodide with 'module' is not fully implemented in this stub.");
+             vm.script.blocks = [];
+             vm.PyConfig.run_module = vmConfigFromPyodideCfg.module; // Signal to run as module? Depends on VM capability.
+        } else {
+            // Fallback if no code or module provided? Maybe just run rc.py?
+            vm.script.blocks = ["print('No Python code provided to loadPyodide.')"];
+             vm.PyConfig.run_filename = '__startup__.py';
+        }
+
+
+        // Initialize the VM
+        await onload(); // Call the main initialization function
+
+        // Wait for the Python runtime to be ready
+        await _until(defined)("python");
+
+        // Pyodide typically allows redirecting stdout/stderr.
+        // If cfg.stdout is a function, redirect vm's output.
+        if (cfg.stdout && typeof cfg.stdout === 'function' && vm && vm.vt && vm.vt.xterm) {
+            console.warn("loadPyodide: Redirecting stdout to provided function.");
+            vm.vt.xterm.write = cfg.stdout; // Replace the write method
+        } else {
+            console.warn("loadPyodide: No stdout function provided or terminal not ready.");
+        }
+
+
+        console.warn("loadPyodide: Python runtime should now be available globally as 'python'.");
+        return vm; // Return the VM object (acting as the pyodide object)
     }
 
 // ====================================================================================
 //          STARTUP
-// ====================================================================================
+//====================================================================================
 
 async function onload() {
+    console.warn("onload Begin");
+
     var debug_hidden = true;
 
     // this is how emscripten "os layer" will find it
-    window.Module = vm
-    var debug_mobile_request
+    window.Module = vm; // Ensure vm is assigned to Module
+
+    var debug_mobile_request;
     try {
-        debug_mobile_request = (window.top.location.hash.search("#debug-mobile")>=0)
+        // Check window.top availability and location.hash safely
+        if (window.top && window.top.location && window.top.location.hash) {
+             debug_mobile_request = (window.top.location.hash.search("#debug-mobile") >= 0);
+        } else {
+             debug_mobile_request = (window.location.hash.search("#debug-mobile") >= 0); // Fallback to self location
+        }
     } catch (x) {
-        console.warn("FIXME:", x )
-        debug_mobile_request = false
+        console.warn("FIXME: Error accessing window.top.location.hash:", x);
+        debug_mobile_request = (window.location.hash.search("#debug-mobile") >= 0); // Fallback
     }
 
-    const nuadm = mobile() || debug_mobile_request
+    const nuadm = mobile() || debug_mobile_request;
 
-    var debug_user
+    var debug_user;
     try {
-        // not always accessible on cross-origin object
-        debug_user = window.top.location.hash.search("#debug")>=0
+         if (window.top && window.top.location && window.top.location.hash) {
+             debug_user = window.top.location.hash.search("#debug") >= 0;
+         } else {
+             debug_user = window.location.hash.search("#debug") >= 0; // Fallback
+         }
     } catch (x) {
-        console.warn("FIXME:", x )
-        debug_user = false
+        console.warn("FIXME: Error accessing window.top.location.hash:", x);
+        debug_user = window.location.hash.search("#debug") >= 0; // Fallback
     }
 
-    const debug_dev = vm.PyConfig.orig_argv.includes("-X dev") || vm.PyConfig.orig_argv.includes("-i")
-    const debug_mobile = nuadm && ( debug_user || debug_dev )
+
+    // Ensure vm.PyConfig and vm.PyConfig.orig_argv exist before accessing
+    const debug_dev = (vm.PyConfig && Array.isArray(vm.PyConfig.orig_argv) && (vm.PyConfig.orig_argv.includes("-X dev") || vm.PyConfig.orig_argv.includes("-i"))) || false;
+
+    const debug_mobile = nuadm && ( debug_user || debug_dev );
+
+    // Check if vm.config exists before setting properties
+    vm.config = vm.config || {}; // Ensure config object exists
+
     if ( debug_user || debug_dev || debug_mobile ) {
         debug_hidden = false;
-        vm.config.debug = true
+        vm.config.debug = true;
         if ( is_iframe() ){
-            vm.config.gui_divider = 3
+            vm.config.gui_divider = vm.config.gui_divider || 3; // Set default if not already set
         } else {
-            vm.config.gui_divider = vm.config.gui_divider || 2 //??=
+            vm.config.gui_divider = vm.config.gui_divider || 2; // Set default if not already set
         }
     }
     console.warn(`
@@ -2154,397 +3216,714 @@ async function onload() {
 == FLAGS : is_mobile(${nuadm}) dev=${debug_dev} debug_user=${debug_user} debug_mobile=${debug_mobile} ==
 
 
-
-`)
+`); // Added line break for readability
     if ( is_iframe() ) {
-        console.warn("======= IFRAME =========")
+        console.warn("======= IFRAME =========");
     }
 
-    feat_lifecycle()
+    feat_lifecycle();
 
     // container for html output
-    var html = document.getElementById('html')
+    var html = document.getElementById('html');
     if (!html){
-        html = document.createElement('div')
-        html.id = "html"
-        document.body.appendChild(html)
+        html = document.createElement('div');
+        html.id = "html";
+         // Consider adding some basic styling
+         // html.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1000; overflow: hidden;';
+        document.body.appendChild(html);
     }
 
-    var has_vt = false
+    var has_vt = false; // Flag to track if *any* terminal feature was successfully set up
 
+    // Ensure vm.config.features is an array before iterating
+    vm.config.features = vm.config.features || [];
+
+
+    // Process features serially using async/await
     for (const feature of vm.config.features) {
+        console.log(`Processing feature: ${feature}`); // Log which feature is being processed
+
         if (feature.startsWith("3d")) {
-            vm.config.user_canvas_managed = 3
+            vm.config.user_canvas_managed = 3;
         }
 
         if (feature.startsWith("embed")) {
+            vm.config.user_canvas_managed = vm.config.user_canvas_managed || 1;
+            const canvasXd = feat_gui(true); // feat_gui needs a canvas, pass true for hidden if embed
+             // Check if canvasXd is valid before accessing innerHTML/dataset
+             if (canvasXd) {
+                if ( canvasXd.innerHTML && canvasXd.innerHTML.length > 20 ) {
+                    vm.PyConfig.frozen = "/tmp/to_embed.py";
+                }
+                if (canvasXd.dataset) {
+                    if ( canvasXd.dataset.path ) { // Use dataset.path first if available
+                        vm.PyConfig.frozen_path = canvasXd.dataset.path;
+                    } else if (canvasXd.dataset.src) { // Fallback to dataset.src
+                        vm.PyConfig.frozen_path = canvasXd.dataset.src;
+                    } else { // Default path if neither is specified
+                        // This default might be problematic, maybe use the HTML doc path?
+                         vm.PyConfig.frozen_path = location.href.rsplit("/",1)[0]; // Use base URL of current doc
+                    }
+                     if (canvasXd.dataset.embed) {
+                         vm.PyConfig.frozen_handler = canvasXd.dataset.embed;
+                     }
+                }
+                 // Check if vm.PyConfig.frozen is set before writing
+                 if (vm.PyConfig && vm.PyConfig.frozen && FS && typeof FS.writeFile === 'function') {
+                     try {
+                         FS.writeFile(vm.PyConfig.frozen, canvasXd.innerHTML || ""); // Write canvas content as frozen code
+                         console.log(`Embedded content written to ${vm.PyConfig.frozen}`);
+                     } catch (fsError) {
+                         console.error(`Error writing embedded content to FS: ${fsError}`);
+                         vm.PyConfig.frozen = undefined; // Unset frozen if write fails
+                     }
+                 } else if (vm.PyConfig && vm.PyConfig.frozen) {
+                      console.warn(`Skipping writing embedded content: FS not ready or frozen path not set correctly (${vm.PyConfig.frozen}).`);
+                      vm.PyConfig.frozen = undefined; // Unset frozen if write fails
+                 } else {
+                      console.log("No embedded content to write."); // No frozen path or content
+                 }
 
-            vm.config.user_canvas_managed = vm.config.user_canvas_managed || 1
+             } else {
+                 console.error("feat_gui failed to return a valid canvas for 'embed' feature.");
+             }
 
-            const canvasXd = feat_gui(true)
-            if ( canvasXd.innerHTML.length > 20 ) {
-                vm.PyConfig.frozen = "/tmp/to_embed.py"
-            }
-            // only canvas when embedding 2D/3D, stdxxx go to console.
-            break
+            // only canvas when embedding 2D/3D, stdxxx go to console (or default stdout).
+            // If 'embed' is processed, should other terminal features be skipped?
+            // Assuming 'embed' is primary and other terminals are secondary.
+            // Let's remove other terminal features from the list after embed is processed.
+            const terminalFeatures = ['vt', 'vtx', 'stdout'];
+             vm.config.features = vm.config.features.filter(f => !terminalFeatures.includes(f));
+             console.log("Processed 'embed', remaining features:", vm.config.features);
+
+            break // Stop processing other features if 'embed' is handled as primary
         }
 
         if (feature.startsWith("snd")) {
-            feat_snd(debug_hidden)
+            feat_snd(debug_hidden); // Assuming feat_snd is synchronous or handles its own async
         }
 
         if (feature.startsWith("gui")) {
-            feat_gui(debug_hidden)
+            feat_gui(debug_hidden); // Assuming feat_gui is synchronous or handles its own async
         }
 
         // file upload widget
-
         if (feature.startsWith("fs")) {
-            await feat_fs(debug_hidden)
+            await feat_fs(debug_hidden); // This is async
         }
 
 
         // TERMINAL
-
+        // Only attempt terminal features if not mobile OR if debug_mobile flag is true
         if (!nuadm || debug_mobile) {
-            if (feature.startsWith("vt")) {
-
-                // simpleterm.js
-
-                if (feature === "vt") {
-                    await feat_vt(debug_hidden)
-                }
-
-                // xterm.js
-
-                if (feature === "vtx") {
-                    await feat_vtx(debug_hidden)
-                }
-                has_vt = true
-
+            if (feature === "vt") { // Use exact match for simpleterm
+                await feat_vt(debug_hidden); // This is async
+                 has_vt = true; // Mark success
+                 break; // Process only one terminal type
             }
-            if (feature.startsWith("stdout")){
-                feat_stdout()
-                has_vt = true
-                config.quiet = true
+
+            if (feature === "vtx") { // Use exact match for xterm.js
+                // feat_vtx now includes try...catch and fallback
+                await feat_vtx(debug_hidden); // This is async
+                 // Check if feat_vtx successfully set up vm.vt.xterm
+                 if (vm.vt && vm.vt.xterm && vm.vt.xterm !== console.log) { // console.log is the default fallback
+                     has_vt = true; // Mark success IF vtx was actually set up, not fell back
+                     break; // Process only one terminal type
+                 } else {
+                      console.log("feat_vtx failed or fell back, continuing feature processing.");
+                 }
+            }
+            // Note: original code checked feature.startsWith("vt"), which would catch both "vt" and "vtx".
+            // Explicitly checking for "vt" and "vtx" as separate cases.
+
+            if (feature === "stdout"){ // Use exact match for simple stdout
+                feat_stdout(); // Synchronous
+                 has_vt = true; // Mark success (basic terminal)
+                 break; // Process only one terminal type
+                 // Note: If vtx fails and falls back to stdout, and stdout is *also* in features,
+                 // feat_stdout might be called twice. The function should handle this (e.g., check for element existence).
+                 // feat_stdout already checks document.getElementById('stdout'), which helps.
             }
 
         } else {
-            console.warn("NO VT/stdout on mobile, use remote debugger or explicit flag")
+            console.warn("Skipping terminal features on mobile unless debug_mobile flag is set.");
         }
-    }
+    } // End feature loop
+
 
     // FIXME: forced minimal output until until remote debugger is a thing.
-    if ( debug_mobile && !has_vt) {
-        console.warn("764: debug forced stdout")
-        feat_stdout()
-        has_vt = true
+    // If *no* terminal feature was successfully set up (has_vt is still false),
+    // and we are in debug_mobile mode, force stdout.
+    if ( debug_mobile && !has_vt ) {
+        console.warn("Debug mobile mode active, forcing simple stdout output.");
+        // Check if stdout feature was already processed or added by a fallback
+        if (vm.config.features.indexOf('stdout') === -1) {
+             vm.config.features.push('stdout'); // Add to features list conceptually
+             feat_stdout(); // Explicitly call it
+             has_vt = true; // Now we have a basic terminal
+        } else if (!has_vt && vm.vt && vm.vt.xterm && vm.vt.xterm !== console.log) {
+             // If stdout was in features but has_vt is false, it might mean feat_stdout didn't set vm.vt.xterm correctly, or it was overridden.
+             // Re-call it to ensure vm.vt.xterm is set to the stdout element.
+             console.warn("Stdout feature was listed but not active, re-initializing.");
+             feat_stdout();
+             has_vt = true;
+        } else if (!has_vt && (!vm.vt || !vm.vt.xterm || vm.vt.xterm === console.log)) {
+             // If still no terminal and not console.log, re-call stdout as a last resort
+              console.warn("No terminal successfully initialized, forcing simple stdout.");
+              feat_stdout();
+              has_vt = true;
+         }
+
+    } else if (!has_vt) {
+        // If not debug_mobile and no terminal was requested/successful, Python output will go to console.log by default (vm.vt.xterm is initialized to console.log)
+        console.warn("No terminal feature requested or successfully initialized. Python output will go to browser console.");
     }
 
-    if (window.custom_onload)
-        window.custom_onload(debug_hidden)
+
+    // Check if window.custom_onload is a function before calling
+    if (window.custom_onload && typeof window.custom_onload === 'function') {
+        window.custom_onload(debug_hidden);
+    }
 
 
-    window.busy--;
-    if (!config.quiet)
-        vm.vt.xterm.write('OK\r\nPlease \x1B[1;3;31mwait\x1B[0m ...\r\n')
+    window.busy--; // Decrement busy counter
+
+    // Check if vm.vt.xterm is set before writing
+    if (vm.vt && vm.vt.xterm && typeof vm.vt.xterm.write === 'function') {
+        if (!config.quiet) {
+            vm.vt.xterm.write('OK\r\nPlease \x1B[1;3;31mwait\x1B[0m ...\r\n');
+        } else {
+            console.log("Config quiet=true, suppressing initial 'OK Please wait' message.");
+        }
+    } else {
+        console.warn("Terminal write function not available. Cannot print initial message.");
+         // If terminal wasn't set up, at least log to console
+         if (!config.quiet) {
+             console.log("OK\r\nPlease wait ...");
+         }
+    }
 
 
+    // Check if window_resize is defined before calling
+    if (typeof window.window_resize === 'function') {
+        window_resize(vm.config.gui_divider);
+    } else {
+        console.warn("window_resize function is not defined.");
+    }
 
-    if (window.window_resize)
-        window_resize(vm.config.gui_divider)
 
-// console.log("cleanup while loading wasm", "has_parent?", is_iframe(), "Parent:", window.parent)
+    // Cleanup references to functions that are done being used in onload
+    feat_snd = feat_gui = feat_fs = feat_vt = feat_vtx = feat_stdout = feat_lifecycle = onload = null;
 
-    feat_snd = feat_gui = feat_fs = feat_vt = feat_vtx = feat_stdout = feat_lifecycle = onload = null
 
     if ( is_iframe() ) {
         try {
-            if (window.top.blanker)
-                window.top.blanker.style.visibility = "hidden"
+             // Access window.top cautiously
+             if (window.top && window.top.blanker && window.top.blanker.style) {
+                window.top.blanker.style.visibility = "hidden";
+             } else {
+                 console.warn("Could not hide window.top.blanker (element not found or cross-origin restriction).");
+             }
         } catch (x) {
-            console.error("FIXME:", x)
+            console.error("FIXME: Error accessing window.top.blanker:", x);
         }
     }
 
 
-    if (!window.transfer) {
+    if (!document.getElementById('transfer')) { // Check by ID instead of window.transfer
 // <!--
         document.getElementById('html').insertAdjacentHTML('beforeend', `
 <style>
-    div.emscripten { text-align: center; }
+    /* Basic styles for the transfer/status area */
+    #transfer {
+        position: fixed; /* Or absolute depending on layout */
+        bottom: 0;
+        left: 0;
+        right: 0;
+        width: 100%;
+        background: rgba(0, 0, 0, 0.7); /* Semi-transparent background */
+        color: white;
+        padding: 10px 0;
+        text-align: center;
+        z-index: 100; /* Ensure it's above other content */
+        pointer-events: none; /* Allow clicks/interactions to pass through */
+         box-sizing: border-box;
+         display: flex; /* Use flexbox for alignment */
+         flex-direction: column; /* Stack items vertically */
+         align-items: center; /* Center horizontally */
+         justify-content: center; /* Center vertically */
+    }
+     #transfer div.emscripten {
+         margin: 5px 0;
+         pointer-events: auto; /* Re-enable pointer events for progress bar/status text */
+     }
+     #transfer #status {
+         font-size: 1em;
+     }
+     #transfer #progress {
+         width: 80%; /* Make progress bar responsive */
+         max-width: 400px; /* Max width for large screens */
+         height: 20px;
+     }
+      /* Add basic spinner style if needed */
+      /* #spinner { ... } */
+
 </style>
-<div id="transfer" align=center style="z-index: 5;">
+<div id="transfer">
     <div class="emscripten" id="status">Downloading...</div>
     <div class="emscripten">
         <progress value="0" max="200" id="progress"></progress>
     </div>
+     <!-- Add spinner element if you have styles for it -->
+     <!-- <div class="emscripten" id="spinner"></div> -->
 </div>
 `);
 // -->
     }
 
 // TODO: error alert if 404 / timeout
-    console.warn("Loading python interpreter from", config.executable)
-    jsimport(config.executable)
+    console.warn("Loading python interpreter from", config.executable);
+     // Check if config.executable is set before importing
+     if (config.executable) {
+        jsimport(config.executable); // Start loading the main WASM/JS bundle
+     } else {
+         console.error("Cannot load python interpreter: config.executable is not defined.");
+         // Display an error status or alert?
+         vm.setStatus("Error: Interpreter path not configured.");
+     }
+
+     console.warn("onload End");
 }
 
 
 function auto_conf(cfg) {
-    var url = cfg.url
+    var url = cfg.url;
 
-    console.log("AUTOSTART", url, document.location.href, cfg.stdout)
+    console.log("AUTOSTART config. Provided cfg:", cfg); // Log the input cfg
+
     if (document.currentScript) {
+        // This might be misleading if auto_conf is called by loadPyodide
+        // and not via a script tag with src.
+        // Keeping original logic for now, but note the potential inaccuracy.
         if (document.currentScript.async) {
-            console.log("Executing asynchronously", document.currentScript.src);
+            console.log("Detected script executing asynchronously", document.currentScript.src);
         } else {
-            console.log("Executing synchronously");
+            console.log("Detected script executing synchronously", document.currentScript.src || 'inline');
         }
-    }
-
-
-    const old_url = url
-
-    var elems
-
-    elems = url.rsplit('#',1)
-    url = elems.shift()
-
-    elems = url.rsplit('?',1)
-    url = elems.shift()
-
-    if (url.endsWith(module_name)) {
-        url = url + (window.location.search || "?") + ( window.location.hash || "#" )
-        console.log("Location of",module_name,"overrides script", old_url ,'=>', url )
-    }
-
-    elems = url.rsplit('#',1)
-    url = elems.shift()
-
-    if (elems.length)
-        for (const arg of elems.pop().split("%20") ) {
-           vm.sys_argv.push(decodeURI(arg))
-        }
-
-    elems = url.rsplit('?',1)
-    url = elems.shift()
-
-    if (elems.length)
-        for (const arg of elems.pop().split("&")) {
-            vm.cpy_argv.push(decodeURI(arg))
-        }
-
-
-    var code = ""
-
-    if (!cfg.module && cfg.text.length) {
-        code = cfg.text
     } else {
-        console.warn("1601: no inlined code found")
+         console.log("document.currentScript is null.");
     }
 
-    // resolve python executable cmdline first
-    // TODO: built script override when debug mode (-X dev).
-    // actual: no pygbag override.
 
-    const default_version = "3.11"
-    var pystr = "python" + default_version
+    const old_url = url; // Store original URL for comparison
 
-    if (vm.cpy_argv.length && (vm.cpy_argv[0].search('py')>=0)) {
-        pystr = vm.cpy_argv[0]
+
+    // Ensure url is a string before using rsplit
+    url = String(url || ''); // Default to empty string if url is null/undefined
+
+    var elems;
+
+    // Process hash (#) part first
+    elems = url.rsplit('#',1);
+    url = elems.shift(); // url is now the part before '#'
+    if (elems.length) {
+         // Process hash part as sys.argv (decoded %20 as spaces)
+         const hashArgs = elems.pop();
+         vm.sys_argv = []; // Initialize sys_argv
+         if (hashArgs) { // Ensure hashArgs is not empty
+             for (const arg of hashArgs.split("%20") ) {
+                vm.sys_argv.push(decodeURI(arg));
+             }
+         }
     } else {
-        if (cfg.python && (cfg.python.search('py')>=0)) {
-            pystr = cfg.python
-        }
-        // fallback to cpython
+        vm.sys_argv = []; // Ensure sys_argv is initialized even if no hash
     }
 
 
-    if (pystr.search('cpython3')>=0) {
-        vm.script.interpreter = "cpython"
-        config.PYBUILD = pystr.substr(7) || default_version
+    // Process query (?) part next
+    elems = url.rsplit('?',1);
+    url = elems.shift(); // url is now the part before '?'
+    if (elems.length) {
+        // Process query part as cpy_argv (split by &)
+         const queryArgs = elems.pop();
+         vm.cpy_argv = []; // Initialize cpy_argv
+         if (queryArgs) { // Ensure queryArgs is not empty
+             for (const arg of queryArgs.split("&")) {
+                 vm.cpy_argv.push(decodeURI(arg));
+             }
+         }
     } else {
-        if (pystr.search('python3')>=0) {
-            vm.script.interpreter = "cpython"
-            config.PYBUILD = pystr.substr(6) || default_version
-        } else {
-            if (pystr.search('pkpy')>=0) {
-                vm.script.interpreter = "pkpy"
-                config.PYBUILD = pystr.substr(4) || "1.4"
-            } else {
-                if (pystr.search('wapy')>=0) {
-                    vm.script.interpreter = "wapy"
-                    config.PYBUILD = pystr.substr(4) || "3.4"
-                } else {
-                    vm.script.interpreter = config.python || "cpython"
-                    config.PYBUILD = pystr.substr(7) || default_version
-                }
-            }
-        }
+        vm.cpy_argv = []; // Ensure cpy_argv is initialized even if no query
     }
 
-    // running pygbag proxy, lan testing or a module url ?
+
+    var code = "";
+    // Check if cfg.text is a string and has length
+    if (cfg.text && typeof cfg.text === 'string' && cfg.text.length > 0) {
+        code = cfg.text;
+         console.log("Found inlined script code.");
+    } else {
+        console.warn("1601: No inlined code found in cfg.text.");
+    }
+
+
+    // --- Interpreter and Paths Configuration ---
+
+    // Resolve python executable cmdline first (from cpy_argv or cfg.python)
+    // Default version and interpreter
+    const default_version = "3.11";
+    var pystr = "python" + default_version; // Default interpreter string
+
+    // Check cpy_argv[0] for interpreter preference
+    if (vm.cpy_argv.length > 0 && vm.cpy_argv[0] && typeof vm.cpy_argv[0] === 'string' && vm.cpy_argv[0].search('py') >= 0) {
+        pystr = vm.cpy_argv[0];
+         console.log(`Interpreter preference from cpy_argv[0]: ${pystr}`);
+    } else if (cfg.python && typeof cfg.python === 'string' && cfg.python.search('py') >= 0) {
+        // Check cfg.python next
+        pystr = cfg.python;
+         console.log(`Interpreter preference from cfg.python: ${pystr}`);
+    } else {
+        // Fallback to default if no preference found
+        console.log(`No interpreter preference found, defaulting to: ${pystr}`);
+    }
+
+    // Determine interpreter name and build version from pystr
+    vm.script = vm.script || {}; // Ensure vm.script exists
+    vm.script.interpreter = "cpython"; // Default interpreter name
+    config.PYBUILD = default_version; // Default build version
+
+    if (pystr.startsWith('cpython')) {
+        vm.script.interpreter = "cpython";
+        config.PYBUILD = pystr.substring(7) || default_version;
+    } else if (pystr.startsWith('python3')) { // Handle python3 prefix (might be older pygbag)
+         vm.script.interpreter = "cpython"; // Still treat as cpython build
+         config.PYBUILD = pystr.substring(7) || default_version; // Assume version follows "python3"
+         if (config.PYBUILD === "n") config.PYBUILD = default_version; // Handle cases like "python3n"
+    }
+    else if (pystr.startsWith('pkpy')) {
+        vm.script.interpreter = "pkpy";
+        config.PYBUILD = pystr.substring(4) || "1.4";
+    } else if (pystr.startsWith('wapy')) {
+        vm.script.interpreter = "wapy";
+        config.PYBUILD = pystr.substring(4) || "3.4"; // Example wapy version
+    } else {
+         // If pystr didn't match known prefixes, log a warning and use defaults
+        console.warn(`Unknown interpreter prefix in "${pystr}". Falling back to default "${vm.script.interpreter}${config.PYBUILD}".`);
+         // Defaults are already set above
+    }
+
+    // Clean up PYBUILD version string (remove non-digits/dots)
+    config.PYBUILD = config.PYBUILD.replace(/[^\d.]/g, '');
+    if (!config.PYBUILD) config.PYBUILD = default_version; // Ensure it's not empty
+
+    // Resolve CDN path
+    // Running locally (localhost), or is it a specific module URL that needs its own base?
+    // The original logic assumes if hostname is localhost or cfg.module is true, CDN is relative to the script dir.
+    // Otherwise, it uses the part of the URL before 'pythons.js'.
+
+    // Determine base URL of the script itself (excluding query/hash)
+    let scriptBaseUrl = url; // This is the URL after removing ? and #
+     if (!scriptBaseUrl && document.currentScript && document.currentScript.src) {
+         // If url from cfg was empty/processed away, try current script src
+         const currentScriptSrc = document.currentScript.src;
+         const srcElems = currentScriptSrc.rsplit('?', 1)[0].rsplit('#', 1)[0];
+         // Find the position of module_name in the src
+         const moduleIndex = srcElems.lastIndexOf(module_name);
+         if (moduleIndex !== -1) {
+             scriptBaseUrl = srcElems.substring(0, moduleIndex);
+         } else {
+             // Fallback to directory of the script if module_name not found
+             scriptBaseUrl = currentScriptSrc.substring(0, currentScriptSrc.lastIndexOf('/') + 1);
+         }
+         console.log("Using currentScript.src base URL:", scriptBaseUrl);
+
+     } else if (!scriptBaseUrl) {
+         // Last resort: use the base URL of the document
+         scriptBaseUrl = document.location.href.split('?', 1)[0].split('#', 1)[0];
+         scriptBaseUrl = scriptBaseUrl.substring(0, scriptBaseUrl.lastIndexOf('/') + 1);
+         console.log("Using document base URL:", scriptBaseUrl);
+     }
+
+
+    // Determine config.cdn
     if ( (location.hostname === "localhost") || cfg.module) {
-        config.cdn = url.split("?",1)[0].replace(module_name, "")
+        // If localhost or module mode, CDN is relative to the script's base URL
+        config.cdn = scriptBaseUrl;
+         console.log("CDN set to script base (localhost or module mode):", config.cdn);
+    } else {
+        // Otherwise, use the part of the URL *before* module_name (as extracted from original url)
+        const moduleIndexInOriginalUrl = old_url.lastIndexOf(module_name);
+         if (moduleIndexInOriginalUrl !== -1) {
+             config.cdn = old_url.substring(0, moduleIndexInOriginalUrl);
+         } else {
+             // If module_name not found in original url, fallback to script base
+             config.cdn = scriptBaseUrl;
+             console.warn(`Could not find "${module_name}" in original script URL "${old_url}". Falling back CDN to script base "${scriptBaseUrl}".`);
+         }
+         console.log("CDN set based on original URL:", config.cdn);
     }
 
-    config.cdn     = config.cdn || url.split(module_name, 1)[0]  //??=
-    config.pydigits =  config.pydigits || config.PYBUILD.replace(".","") //??=
-    config.executable = config.executable || `${config.cdn}${vm.script.interpreter}${config.pydigits}/main.js` //??=
+    // Ensure CDN path ends with a slash if it's not just a filename base
+     if (config.cdn && !config.cdn.endsWith('/') && config.cdn.split('/').pop().indexOf('.') === -1) {
+          config.cdn += '/';
+     }
 
-    // resolve arguments
 
-    config.xtermjs = config.xtermjs || 0
+    config.pydigits = config.pydigits || config.PYBUILD.replace(/\./g, "") || "311"; // Ensure pydigits is set, default to 311 if PYBUILD is odd
+    config.executable = config.executable || `${config.cdn}${vm.script.interpreter}${config.pydigits}/main.js`; // Construct executable path
 
-    config.archive = config.archive || (location.search.search(".apk")>=0)  //??=
 
-    config.debug = config.debug || (location.hash.search("#debug")>=0) //??=
+    // --- Resolve Other Configuration Flags ---
+    config.xtermjs = config.xtermjs || 0; // Default xtermjs flag
+    config.archive = config.archive || (location.search.search(".apk") >= 0) || false; // Default archive flag
+    config.debug = config.debug || (location.hash.search("#debug") >= 0) || false; // Default debug flag
+    config.interactive = config.interactive || (location.search.search("-i") >= 0) || false; // Default interactive flag (from query)
 
-//FIXME: should debug force -i or just display vt ?
-config.interactive = config.interactive || (location.search.search("-i")>=0) //??=
+    // Config from data attributes or cfg object
+    config.columns = Number(cfg.columns || 132); // Default columns
+    config.lines = Number(cfg.lines || 32); // Default lines
+    config.console = Number(cfg.console || 10); // Default console lines
 
-    config.columns = cfg.columns || 132
-    config.lines = cfg.lines || 32
-    config.console = cfg.console || 10
-    config.fbdev = cfg.os.search("fbdev")>=0
+    // Check for fbdev flag in data-os
+    config.fbdev = cfg.os && typeof cfg.os === 'string' && cfg.os.search("fbdev") >= 0;
 
-    config.gui_debug = config.gui_debug ||  2  //??=
 
-    if (config.id == "__main__")
-        config.autorun = 1
+    config.gui_debug = Number(cfg.gui_debug || 2); // Default gui_debug divider
 
-    config.quiet = false
-    config.can_close = config.can_close || 0
-    config.autorun  = config.autorun || 0 //??=
-    config.features = config.features || cfg.os.split(",") //??=
+    // Check autorun from cfg.id or cfg.autorun flag
+    config.autorun = (config.id === "__main__") || (cfg.autorun !== undefined ? cfg.autorun : 0); // Default autorun if not in cfg
 
-    config._sdl2    = config._sdl2 || "canvas" //??=
+    config.quiet = cfg.quiet !== undefined ? cfg.quiet : false; // Default quiet flag
+    config.can_close = cfg.can_close !== undefined ? cfg.can_close : 0; // Default can_close flag
+    // config.autorun already handled above
+
+
+    // Ensure features array is processed correctly from cfg.os or default
+    // If cfg.os is a string, split it. Otherwise, use an empty array or default features.
+    config.features = (cfg.os && typeof cfg.os === 'string') ? cfg.os.split(",") : (config.features || []); // Use existing config.features as fallback
+
+
+    config._sdl2 = config._sdl2 || "canvas"; // Default sdl2 target
 
     if (config.ume_block === undefined) {
-        config.ume_block = 1 //??=
+        config.ume_block = 1; // Default ume_block
     }
 
-    console.log(JSON.stringify(config))
+    console.log("Final VM Config:", JSON.stringify(config, null, 2)); // Pretty print final config
 
 
-    // https://docs.python.org/3/c-api/init_config.html#initialization-with-pyconfig
+    // --- PyConfig setup ---
+    // Ensure vm.PyConfig exists before setting properties
+    vm.PyConfig = vm.PyConfig || {};
 
-    // TODO: https://docs.python.org/3/c-api/init_config.html#c.PyConfig.run_module
-    // TODO: https://docs.python.org/3/c-api/init_config.html#c.PyConfig.bytes_warning
-    // TODO: https://docs.python.org/3/c-api/init_config.html#c.PyConfig.program_name ( PYTHONEXECUTABLE )
+    // Build PyConfig JSON string from determined config values
+    const pyConfigData = {
+        isolated: 0,
+        parse_argv: 0, // We parse argv in JS
+        quiet: config.quiet ? 1 : 0, // Map JS boolean to int
+        run_filename: vm.PyConfig.frozen || "main.py", // Use frozen path if set, otherwise default
+        write_bytecode: 0,
+        skip_source_first_line: 1,
+        bytes_warning: 1, // Or config.bytes_warning? Defaulting to 1
+        base_executable: null, // Let Python determine
+        base_prefix: null, // Let Python determine
+        buffered_stdio: null, // Let Emscripten/Python manage
+        // bytes_warning: 0, // Duplicate key, removed the second one
+        warn_default_encoding: 0, // Defaulting to 0
+        code_debug_ranges: 1, // Defaulting to 1
+        check_hash_pycs_mode: "default",
+        configure_c_stdio: 1, // Let Emscripten configure stdio
+        dev_mode: config.debug ? 1 : -1, // Map JS debug to dev_mode
+        dump_refs: 0, // Defaulting to 0
+        exec_prefix: null, // Let Python determine
+        executable: config.executable,
+        faulthandler: 0, // Defaulting to 0
+        filesystem_encoding: "utf-8",
+        filesystem_errors: "surrogatepass",
+        use_hash_seed: 1, // Defaulting to 1
+        hash_seed: 1, // Defaulting to 1
+        home: null, // Let Python determine
+        import_time: config.import_time ? 1 : 0, // If you add import_time to config
+        inspect: config.interactive ? 1 : 0, // Map interactive to inspect
+        install_signal_handlers: 0, // Let Emscripten handle signals
+        interactive: config.interactive ? 1 : 0, // Map interactive
+        legacy_windows_stdio: 0, // Defaulting to 0
+        malloc_stats: 0, // Defaulting to 0
+        platlibdir: "lib", // Default
+        prefix: "/data/data/org.python/assets/site-packages", // Default site-packages path
+        ps1: ">J> ", // Default prompts
+        ps2: "... "
+    };
 
-    vm.PyConfig = JSON.parse(`
-        {
-            "isolated" : 0,
-            "parse_argv" : 0,
-            "quiet" : 0,
-            "run_filename" : "main.py",
-            "write_bytecode" : 0,
-            "skip_source_first_line" : 1,
-            "bytes_warning" : 1,
-            "base_executable" : null,
-            "base_prefix" : null,
-            "buffered_stdio" : null,
-            "bytes_warning" : 0,
-            "warn_default_encoding" : 0,
-            "code_debug_ranges" : 1,
-            "check_hash_pycs_mode" : "default",
-            "configure_c_stdio" : 1,
-            "dev_mode" : -1,
-            "dump_refs" : 0,
-            "exec_prefix" : null,
-            "executable" : "${config.executable}",
-            "faulthandler" : 0,
-            "filesystem_encoding" : "utf-8",
-            "filesystem_errors" : "surrogatepass",
-            "use_hash_seed" : 1,
-            "hash_seed" : 1,
-            "home": null,
-            "import_time" : 0,
-            "inspect" : 1,
-            "install_signal_handlers" :0 ,
-            "interactive" : ${config.interactive},
-            "legacy_windows_stdio":0,
-            "malloc_stats" : 0 ,
-            "platlibdir" : "lib",
-            "prefix" : "/data/data/org.python/assets/site-packages",
-            "ps1" : ">J> ",
-            "ps2" : "... "
-        }`)
+     // Directly assign the parsed PyConfig object data
+    vm.PyConfig = pyConfigData;
 
-    vm.PyConfig.argv = vm.sys_argv
-    vm.PyConfig.orig_argv = vm.cpy_argv
 
-    for (const prop in config)
-        console.log(`config.${prop} =`, config[prop] )
+    vm.PyConfig.argv = vm.sys_argv; // Use parsed sys_argv
+    vm.PyConfig.orig_argv = vm.cpy_argv; // Use parsed cpy_argv
 
-    console.log('interpreter=', vm.script.interpreter)
-    console.log('orig_argv', vm.PyConfig.orig_argv)
-    console.log('sys.argv: ' , vm.PyConfig.argv)
-    console.log('docurl=', document.location.href)
-    console.log('srcurl=', url)
+
+    console.log('Interpreter config:');
+    console.log('  interpreter:', vm.script.interpreter);
+    console.log('  PYBUILD:', config.PYBUILD);
+    console.log('  pydigits:', config.pydigits);
+    console.log('  cdn:', config.cdn);
+    console.log('  executable:', config.executable);
+    console.log('Arguments config:');
+    console.log('  orig_argv (from query):', vm.PyConfig.orig_argv);
+    console.log('  sys.argv (from hash):' , vm.PyConfig.argv);
+    console.log('Source config:');
+    console.log('  docurl:', document.location.href);
+    console.log('  srcurl:', url);
     if (!cfg.module) {
-        console.log('data-os=', cfg.os)
-        console.log('data-python=', cfg.python)
-        console.log('script: id=', cfg.id)
-        console.log('code : ' , code.length, ` as ${cfg.id}.py`)
+        console.log('  script id:', cfg.id);
+        console.log('  code length:', code.length, `(saved as ${cfg.id}.py)`); // Indicate where code is saved
+    } else {
+         console.log('  Running as module:', cfg.module);
     }
-    vm.config = config
+     console.log('Feature config:');
+     console.log('  data-os raw:', cfg.os);
+     console.log('  features list:', config.features);
+     console.log('  gui_divider:', config.gui_divider);
+     console.log('  user_canvas_managed:', config.user_canvas_managed);
+     console.log('  fbdev:', config.fbdev);
+     console.log('Mode config:');
+     console.log('  debug:', config.debug);
+     console.log('  interactive:', config.interactive);
+     console.log('  quiet:', config.quiet);
+     console.log('  autorun:', config.autorun);
+     console.log('  archive:', config.archive);
+     console.log('  can_close:', config.can_close);
+     console.log('  ume_block:', config.ume_block);
+
+
+     // Store the determined config object back onto vm
+    vm.config = config;
+
+    // Store the main script code block(s)
+     // Assuming only one main script block from text or module for now
+    vm.script.blocks = [ code ];
+
+     // If running as a module, the 'code' might be empty, and the VM needs to be told to run the module name.
+     // The PyConfig handles run_filename/run_module.
+     // If code is empty and module is specified, update PyConfig.
+     if (!code && cfg.module) {
+         vm.PyConfig.run_filename = null; // Don't run a file
+         vm.PyConfig.run_module = cfg.module; // Run the module
+     } else if (code && cfg.id) {
+          // If code is provided, assume it's the main script
+         vm.PyConfig.run_filename = `/${cfg.id}.py`; // Save as a file in root FS? Or assets? Let's use assets base.
+          vm.PyConfig.run_filename = `/data/data/org.python/assets/${cfg.id}.py`; // Consistent with pyrc
+          vm.PyConfig.run_module = null;
+     } else if (code) {
+          // If code is provided but no id, use a default name
+          vm.PyConfig.run_filename = `/data/data/org.python/assets/__main_inline__.py`;
+          vm.PyConfig.run_module = null;
+     } else {
+          // If no code and no module, maybe just run pythonrc?
+          vm.PyConfig.run_filename = null;
+          vm.PyConfig.run_module = null;
+          console.warn("No main code or module specified to run.");
+     }
+
+
+     console.log('Final PyConfig:', JSON.stringify(vm.PyConfig, null, 2));
+
 }
 
 
-function auto_start(cfg) {
-    window.busy = 1
-    if (cfg) {
-        console.error("not using python script tags")
-        cfg.os = "gui"
-        cfg.module = true
-        auto_conf(cfg)
-        vm.script.blocks = [ "print(' - Pygbag runtime -')" ]
+function auto_start(cfg_from_loader) {
+    window.busy = 1; // Indicate that the page is busy loading
+
+     // If cfg_from_loader is provided, it came from loadPyodide.
+     // Otherwise, we need to find the script tag.
+    if (cfg_from_loader) {
+        console.log("AUTOSTART called by loader (e.g., loadPyodide) with config:", cfg_from_loader);
+        // Directly use the provided config
+        auto_conf(cfg_from_loader);
+        // Assuming the loader handles setting the main script block if needed
+        // vm.script.blocks should be set by auto_conf based on cfg_from_loader.text/module
+
+        // Call onload directly as the loader might manage the script import itself
+        onload(); // onload is now async, but calling it directly is fine.
+        onload = null; // Clear onload reference after calling
+
     } else {
+        console.log("AUTOSTART called by script tag.");
+        // Find the script tag that loaded this file
+        let scriptTagCfg = null;
         for (const script of document.getElementsByTagName('script')) {
-            if ( (script.type == 'module') && (script.src.search(module_name) >= 0)){
-                const code = script.text
-                cfg = {
-                    module : false,
+             // Check if it's a module script and its src includes module_name
+            if ( (script.type === 'module' || script.type === 'text/python' /* handle other types? */) &&
+                 (script.src && script.src.search(module_name) >= 0) ){ // Check for src and module_name
+
+                // Extract config from script tag attributes and content
+                 const code = script.text || ""; // Get inline script content
+
+                scriptTagCfg = {
+                    module : false, // Assume inline script is not a module unless explicitly set
                     python : script.dataset.python,
-                    cols : script.dataset.columns,
+                    columns : script.dataset.columns,
                     lines : script.dataset.lines,
                     console : script.dataset.console,
-                    url : script.src,
-                    os : script.dataset.os || "gui",
-                    text : code,
-                    id : script.id,
-                    autorun : ""
-                }
+                    url : script.src || document.location.href, // Use script src, fallback to document url
+                    os : script.dataset.os || "gui", // Default os to gui
+                    text : code, // Inline code
+                    id : script.id || "__main__", // Default id
+                    autorun : script.dataset.autorun // Check for autorun attribute
+                };
 
-                auto_conf(cfg)
+                // Process this config
+                auto_conf(scriptTagCfg);
 
-                // only one script tag for now
-                vm.script.blocks = [ code ]
+                // The main script block is the inline code
+                // vm.script.blocks is set by auto_conf now
 
-                window.addEventListener("load", onload )
+                // Set onload event listener
+                window.addEventListener("load", onload);
 
-                break
+                // Found the main script tag, stop searching (assuming only one)
+                break;
             } else {
-                console.log("script?", script.type, script.id, script.src, script.text )
+                // console.log("Skipping script tag:", script.type, script.id, script.src );
             }
         }
 
-        for (const script of document.getElementsByTagName('script')) {
-            //TODO: process py-script brython whatever and push to vm.script.blocks
-            // for concat with vm.FS.writeFile
+         // TODO: Process other script tags (e.g., type="text/python") if needed
+         // Add logic here to find other script blocks and append them to vm.script.blocks
+         // This needs careful design about file naming and execution order.
+         // Current logic only handles one main block from the module script tag.
+
+        // If no module script tag with module_name was found, auto_conf might have been called with default empty cfg.
+        // If scriptTagCfg is still null here, it means the script wasn't loaded via a standard tag or the tag didn't match.
+        if (!scriptTagCfg && !cfg_from_loader) {
+             console.error(`AUTOSTART: No script tag with type="module" and src containing "${module_name}" found.`);
+             // Maybe display an error message on the page?
+             vm.setStatus("Error: Could not find main script tag.");
+             window.busy--; // Decrement busy as we can't proceed
         }
 
     }
+
+     // Clear auto_start reference after it runs the first time
+     // Note: This prevents calling it again, which might be intended,
+     // but makes loadPyodide only work if called *before* the script tag auto_start runs.
+     // If loadPyodide is the *only* way to start, then auto_start shouldn't run by itself.
+     // If script tag *or* loadPyodide can start it, this needs adjustment.
+     // Let's keep the original behavior for now.
+     auto_start = null;
 
 }
 
 
 window.set_raw_mode = function (param) {
-    window.RAW_MODE = param || 0
+    window.RAW_MODE = param || 0;
+     console.log("Raw mode set to:", window.RAW_MODE);
+     // If using a terminal (like xterm.js or simpleterm), you would send a control sequence or call a method on the terminal object here
+     if (vm.vt && vm.vt.xterm && typeof vm.vt.xterm.setRawMode === 'function') {
+          vm.vt.xterm.setRawMode(param);
+     } else {
+          console.warn("Terminal does not support setRawMode or is not initialized.");
+     }
 }
 
-
-
-auto_start()

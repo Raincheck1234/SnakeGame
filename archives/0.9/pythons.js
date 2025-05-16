@@ -2279,7 +2279,7 @@ window.svg.init = function () {
      }
 }
 
-window.svg.render =  function * (path, dest) {
+window.svg.render =  async function * (path, dest) {
      if (!svg.ctx) {
           console.error("SVG rendering context not initialized. Call svg.init first or ensure canvas exists.");
           yield new Error("SVG context not available"); // Yield error
